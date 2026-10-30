@@ -1,0 +1,84 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Community EV Charging",
+        "description": "The charging server's address on your network, e.g. http://192.168.1.20:8081, and its API_TOKEN.",
+        "data": {
+          "url": "Server address",
+          "token": "API token"
+        }
+      },
+      "reauth_confirm": {
+        "title": "New API token",
+        "description": "The server refused the token. Enter the current API_TOKEN.",
+        "data": {
+          "token": "API token"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Can't reach the server at that address.",
+      "invalid_auth": "The server refused that token."
+    },
+    "abort": {
+      "already_configured": "This server is already set up.",
+      "reauth_successful": "Token updated."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "state": {
+        "name": "State",
+        "state": {
+          "available": "Available",
+          "preparing": "Car plugged in",
+          "charging": "Charging",
+          "suspendedev": "Paused by car",
+          "suspendedevse": "Paused by charger",
+          "finishing": "Finishing",
+          "reserved": "Reserved",
+          "unavailable": "Unavailable",
+          "faulted": "Faulted",
+          "offline": "Offline",
+          "unknown": "Unknown"
+        }
+      },
+      "power": {
+        "name": "Power"
+      },
+      "session_energy": {
+        "name": "Session energy"
+      },
+      "session_cost": {
+        "name": "Session cost"
+      },
+      "today_energy": {
+        "name": "Energy today"
+      },
+      "month_energy": {
+        "name": "Energy this month"
+      },
+      "month_taken": {
+        "name": "Taken this month"
+      },
+      "month_fees": {
+        "name": "PayPal fees this month"
+      },
+      "month_charges": {
+        "name": "Charges this month"
+      }
+    },
+    "binary_sensor": {
+      "online": {
+        "name": "Online"
+      },
+      "charging": {
+        "name": "Charging"
+      },
+      "solar_rate": {
+        "name": "Solar rate"
+      }
+    }
+  }
+}

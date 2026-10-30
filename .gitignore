@@ -1,0 +1,17 @@
+# Secrets: never commit
+*.pem
+*.key
+.env
+env
+/deploy/cloudflared/config.yml
+/deploy/cloudflared/*.json
+credentials*.json
+
+# Local
+__pycache__/
+*.pyc
+.venv/
+*.sqlite3
+*.db
+.DS_Store
+.venv-ha/

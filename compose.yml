@@ -1,0 +1,45 @@
+# Run from the checkout:  docker compose up -d --build   (see docs/deploy.md)
+#
+# Host paths, outside the checkout:
+#   /etc/evcharge/env                settings, mode 600 (copy env.example)
+#   /etc/evcharge/brand/             logo file for BRAND_LOGO, readable by uid 10001
+#   /var/lib/evcharge/               session database, owned by uid 10001 (the app's user)
+#   /etc/cloudflared/config.yml      tunnel ingress (from deploy/cloudflared/config.yml.example)
+#   /etc/cloudflared/<tunnel>.json   tunnel credentials, owned by uid 65532 (cloudflared's user)
+# and .env beside this file:  OCPP_BIND=<this host's LAN address>
+
+name: evcharge
+
+services:
+  # Charge service: pay pages, PayPal, and the OCPP server the charger connects to.
+  app:
+    build: .
+    image: ev-ocpp-paypal:local
+    env_file:
+      - path: /etc/evcharge/env   # PayPal keys etc., see docs/paypal.md
+        required: false                 # without it the pages say "not set up yet"
+    volumes:
+      - /var/lib/evcharge:/data   # SQLite, owned by uid 10001
+      - /etc/evcharge/brand:/brand:ro   # logo for BRAND_LOGO
+    ports:
+      # OCPP for the charger. Set OCPP_BIND in .env beside this file to the host's
+      # LAN address (e.g. OCPP_BIND=192.168.1.20); the default is localhost only.
+      - "${OCPP_BIND:-127.0.0.1}:9000:9000"
+      # Admin pages (and the public ones) on the LAN: http://<OCPP_BIND>:8081/admin
+      - "${OCPP_BIND:-127.0.0.1}:8081:8080"
+    restart: unless-stopped
+    networks: [tunnel]
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.10.4
+    command: ["tunnel", "--no-autoupdate", "--config", "/etc/cloudflared/config.yml", "run"]
+    volumes:
+      - /etc/cloudflared:/etc/cloudflared:ro
+    restart: unless-stopped
+    depends_on: [app]
+    networks: [tunnel]
+
+networks:
+  # Shared by app and cloudflared only. Has outbound internet (cloudflared needs it);
+  # nothing is published on the VM's LAN address from this network.
+  tunnel: {}

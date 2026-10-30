@@ -1,0 +1,31 @@
+# /etc/cloudflared/config.yml on the host (copy this, fill in TUNNEL_ID and your hostname).
+# Mounted read-only into the cloudflared container by compose.yml.
+# Locally-managed tunnel: the ingress rules below are the source of truth,
+# kept in git so a change to what's public shows up in review.
+#
+# Check after any edit:
+#   docker compose run --rm cloudflared tunnel --config /etc/cloudflared/config.yml ingress validate
+#   docker compose run --rm cloudflared tunnel --config /etc/cloudflared/config.yml ingress rule https://ev.example.org/admin   # must hit the 404 rule
+
+tunnel: TUNNEL_ID
+credentials-file: /etc/cloudflared/TUNNEL_ID.json
+
+ingress:
+  # Payment pages, their static assets, and the PayPal webhook. Nothing else.
+  - hostname: ev.example.org
+    path: ^/(pay|static|webhooks/paypal)(/.*)?$
+    service: http://app:8080
+
+  # The bare hostname goes to the payment landing page, so a QR code can use it.
+  - hostname: ev.example.org
+    path: ^/$
+    service: http://app:8080
+
+  # A charger on 4G connects through the tunnel. Set OCPP_PASSWORD_<id> for each
+  # charge point first: the app refuses tunnel connections without one.
+  # - hostname: ev.example.org
+  #   path: ^/ocpp/(CP1|CP2)$
+  #   service: http://app:9000
+
+  # Everything else, including /admin and /api, is refused at the edge.
+  - service: http_status:404
