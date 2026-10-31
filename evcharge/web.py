@@ -43,6 +43,7 @@ RATE_RULE = "<p>Each kWh is charged at the rate in force when it is delivered.</
 HOW_IT_WORKS = """<p>PayPal holds an amount while you charge. When you finish, you pay only for
 the energy used and the rest is released. Charging stops if the cost reaches
 the amount held.</p>"""
+NO_DATA = "We keep no payment or personal data."
 PROJECT_URL = "https://github.com/JR4AA/community-ev-charging"
 POWERED_BY = (f'<p class="small powered">Powered by <a href="{PROJECT_URL}" rel="noopener">'
               'community-ev-charging</a>, open source.</p>')
@@ -162,7 +163,7 @@ def create_app(settings: config.Settings | None = None, paypal: PayPal | None = 
                 "<p class=small>Plug in, then open the socket's page (or scan its QR code) to pay.</p>"
                 f"<h2>Prices</h2>{RATE_RULE}{_rates_table(settings.tariff, db.solar_active(), _now_band(settings))}{HOW_IT_WORKS}"
                 f"<p>You can hold {', '.join(f'£{h:.0f}' for h in settings.hold_options)}. "
-                f"Pay by {'debit or credit card' if settings.payment_methods == 'card' else 'PayPal or card'}.</p>")
+                f"Pay by {'debit or credit card' if settings.payment_methods == 'card' else 'PayPal or card'}. {NO_DATA}</p>")
         return page("EV charging", body, refresh=30, note_at_foot=False)
 
     @app.get("/pay/{connector}", response_class=HTMLResponse)
@@ -324,7 +325,7 @@ def _pay_body(settings: config.Settings, connector: str, solar_on: bool) -> str:
 <tr><th></th>{head}</tr>{choices}</table>
 <p class=small>The energy each amount covers, if it is all at that rate.</p></fieldset>
 <p class=small>{"Pay by debit or credit card." if card_only else
-"Pay with PayPal or a debit or credit card. You do not need a PayPal account to pay by card."}</p>
+"Pay with PayPal or a debit or credit card. You do not need a PayPal account to pay by card."} {NO_DATA}</p>
 <div id="buttons"></div>
 <p id="msg" role="alert"></p>
 <script src="{sdk}"></script>
