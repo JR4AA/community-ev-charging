@@ -92,6 +92,7 @@ def test_prices_on_a_201_charger_with_a_screen(tmp_path, fake):
     sid = pay(c)
     db = app.state.payments.db
     wait_for(lambda: db.session(sid)["status"] == "CAPTURED")
+    wait_for(lambda: any(k == "Ended" for k, _ in sim.cp.screen))   # the charger may read its answer after capture
     kinds = [k for k, _ in sim.cp.screen]
     assert kinds[0] == "Started" and kinds.count("Updated") >= 3 and kinds[-1] == "Ended"
     costs = [d["cost"] for k, d in sim.cp.screen if k != "Ended"]
@@ -110,6 +111,7 @@ def test_free_charge_on_a_201_charger(tmp_path, fake):
     db = app.state.payments.db
     sid = db.recent_sessions(1)[0]["id"]
     wait_for(lambda: db.session(sid)["status"] == "COMPLETED", timeout=20)
+    wait_for(lambda: any(k == "Ended" for k, _ in sim.cp.screen))
     assert all(d["cost"] == 0 for _, d in sim.cp.screen) and sim.cp.screen[-1][0] == "Ended"
     assert "No charge. Thank you!" in sim.cp.screen[-1][1]["content"]
     sim.close()
