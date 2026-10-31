@@ -39,8 +39,8 @@ try { const s = localStorage.getItem("evcharge.session");
   if (s && !location.pathname.endsWith(s)) { const p = document.getElementById("yours");
     p.firstChild.href = "/pay/session/" + encodeURIComponent(s); p.hidden = false; } } catch (e) {}
 </script>"""
-HOW_IT_WORKS = """<p>Each kWh is charged at the rate in force when it is delivered.</p>
-<p>PayPal holds an amount while you charge. When you finish, you pay only for
+RATE_RULE = "<p>Each kWh is charged at the rate in force when it is delivered.</p>"
+HOW_IT_WORKS = """<p>PayPal holds an amount while you charge. When you finish, you pay only for
 the energy used and the rest is released. Charging stops if the cost reaches
 the amount held.</p>"""
 PROJECT_URL = "https://github.com/JR4AA/community-ev-charging"
@@ -160,7 +160,7 @@ def create_app(settings: config.Settings | None = None, paypal: PayPal | None = 
                         f'<td class=small>{html.escape(power)}</td><td>{what}</td></tr>')
         body = (f"{_note(settings.page_note)}<h2>Sockets</h2><table class=sockets>{''.join(rows)}</table>"
                 "<p class=small>Plug in, then open the socket's page (or scan its QR code) to pay.</p>"
-                f"<h2>Prices</h2>{_rates_table(settings.tariff, db.solar_active(), _now_band(settings))}{HOW_IT_WORKS}"
+                f"<h2>Prices</h2>{RATE_RULE}{_rates_table(settings.tariff, db.solar_active(), _now_band(settings))}{HOW_IT_WORKS}"
                 f"<p>You can hold {', '.join(f'£{h:.0f}' for h in settings.hold_options)}. "
                 f"Pay by {'debit or credit card' if settings.payment_methods == 'card' else 'PayPal or card'}.</p>")
         return page("EV charging", body, refresh=30, note_at_foot=False)
@@ -181,7 +181,7 @@ def create_app(settings: config.Settings | None = None, paypal: PayPal | None = 
             return page(title, back=True, subtitle=settings.power_label(connector), body="<p>This socket is out of service at the moment. Sorry.</p>", refresh=30)
         if state != READY:
             return page(title, back=True, subtitle=settings.power_label(connector), body="<p><strong>Plug your car in first.</strong> This page will then let you pay.</p>"
-                         + _rates_table(settings.tariff, db.solar_active(), _now_band(settings)), refresh=5)
+                         + RATE_RULE + _rates_table(settings.tariff, db.solar_active(), _now_band(settings)), refresh=5)
         return page(title, back=True, subtitle=settings.power_label(connector), body=_pay_body(settings, connector, db.solar_active()))
 
     @app.post("/pay/api/orders")
@@ -315,6 +315,7 @@ def _pay_body(settings: config.Settings, connector: str, solar_on: bool) -> str:
         for h in settings.hold_options
     )
     return f"""
+{RATE_RULE}
 {_rates_table(tariff, solar_on, now_band)}
 {HOW_IT_WORKS}
 <fieldset aria-label="Amount to hold">
