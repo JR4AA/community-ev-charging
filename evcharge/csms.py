@@ -46,11 +46,12 @@ from websockets.http11 import Request
 
 from .config import Settings
 from .db import DB
-from .payments import PaymentError, Payments
+from .payments import PaymentError, Payments, session_tariff
 
 log = logging.getLogger(__name__)
 
 SUBPROTOCOL = "ocpp1.6"
+COSTMSG = "org.openchargealliance.costmsg"   # OCA "California pricing" DataTransfer vendor id
 ENERGY = "Energy.Active.Import.Register"
 OFFLINE = "Offline"
 LOCKOUT_FAILURES = 5
@@ -109,6 +110,11 @@ class ChargePoint(OcppChargePoint):
             await self.call(call.TriggerMessage(requested_message=MessageTrigger.status_notification))
         except Exception:
             log.exception("%s: configuring failed", self.id)
+        try:
+            await self.csms.read_configuration(self.id)
+            await self.csms.setup_price_display(self.id)
+        except Exception:
+            log.exception("%s: reading settings / price display setup failed", self.id)
 
     @on(Action.boot_notification)
     def on_boot(self, charge_point_vendor, charge_point_model, **kw):
@@ -153,6 +159,7 @@ class ChargePoint(OcppChargePoint):
         if ok:
             await asyncio.to_thread(self.csms.payments.mark_charging, s["id"])
             self.db.log(s["id"], "transaction_started", f"tx {tx} meter {meter_start} Wh")
+            asyncio.create_task(self.csms.send_running_cost(tx, delay=0.5))
         else:
             log.warning("%s/%s: refused transaction for idTag %s", self.id, connector_id, id_tag)
         return call_result.StartTransaction(transaction_id=tx, id_tag_info=IdTagInfo(
@@ -165,6 +172,7 @@ class ChargePoint(OcppChargePoint):
             for at, wh in energy_readings(meter_value):
                 self.db.add_reading(t["id"], at, wh)
             await self.csms.check_limit(t)
+            asyncio.create_task(self.csms.send_running_cost(t["id"]))
         return call_result.MeterValues()
 
     @on(Action.stop_transaction)
@@ -176,7 +184,7 @@ class ChargePoint(OcppChargePoint):
             self.db.stop_transaction(t["id"], meter_stop, utc_iso(timestamp), kw.get("reason"))
             self.db.log(t["session_id"], "transaction_stopped", f"tx {t['id']} meter {meter_stop} Wh {kw.get('reason')}")
             # Answer the charger first; settling talks to PayPal.
-            asyncio.create_task(self.csms.settle(t["id"]))
+            asyncio.create_task(self.csms.settle(t["id"], final_cost=True))
         return call_result.StopTransaction(id_tag_info=IdTagInfo(status=AuthorizationStatus.accepted))
 
     @on(Action.data_transfer)
@@ -202,6 +210,9 @@ class CSMS:
         self.status: dict[tuple[str, int], str] = {}
         # Per charge point: vendor, model, firmware, serial (from BootNotification), last_seen.
         self.info: dict[str, dict] = {}
+        self.config: dict[str, dict] = {}         # last GetConfiguration per charge point
+        self.display: dict[str, bool] = {}        # price messages on its screen?
+        self.last_display: dict[str, dict] = {}   # last price message and the charger's answer
         self._failures: dict[str, list[float]] = {}
         self._stopping: set[int] = set()
 
@@ -261,12 +272,106 @@ class CSMS:
             # library reads the charger's reply to our call only after it returns.
             asyncio.create_task(self.remote_stop(s["id"], f"limit reached (£{cost})"))
 
-    async def settle(self, tx: int) -> None:
+    async def settle(self, tx: int, final_cost: bool = False) -> None:
         t = self.db.transaction(tx)
         try:
             await asyncio.to_thread(self.payments.settle, t["session_id"], readings=self.db.readings(tx))
         except PaymentError:
             log.exception("settling tx %s failed; will retry", tx)
+        if final_cost:
+            await self.send_final_cost(tx)
+
+    # -- charger settings and its screen ------------------------------------
+
+    async def read_configuration(self, cp_id: str) -> list[dict]:
+        """GetConfiguration: every setting the charger reports. Kept for the admin page."""
+        cp = self.points.get(cp_id)
+        if not cp:
+            raise PaymentError(503, f"{cp_id} is offline")
+        r = await cp.call(call.GetConfiguration())
+        keys = sorted(r.configuration_key or [], key=lambda k: k["key"])
+        self.config[cp_id] = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                              "keys": keys, "unknown": r.unknown_key or []}
+        return keys
+
+    def _key(self, cp_id: str, name: str) -> dict | None:
+        return next((k for k in self.config.get(cp_id, {}).get("keys", []) if k["key"] == name), None)
+
+    async def setup_price_display(self, cp_id: str) -> None:
+        """Turn on the OCA 'California pricing' screen messages if the charger has them
+        (it reports CustomDisplayCostAndPrice), and give it the tariff to show while idle."""
+        self.display[cp_id] = False
+        if self.settings.display_prices == "off":
+            return
+        flag = self._key(cp_id, "CustomDisplayCostAndPrice")
+        if not flag:
+            log.info("%s: no CustomDisplayCostAndPrice, so no prices on its screen", cp_id)
+            return
+        cp = self.points[cp_id]
+        if str(flag.get("value", "")).lower() != "true":
+            if flag.get("readonly"):
+                return
+            r = await cp.call(call.ChangeConfiguration(key="CustomDisplayCostAndPrice", value="true"))
+            if r.status != "Accepted":
+                log.warning("%s: enabling the price display -> %s", cp_id, r.status)
+                return
+        self.display[cp_id] = True
+        if self._key(cp_id, "DefaultPrice"):
+            text = self.settings.tariff.describe()
+            r = await cp.call(call.ChangeConfiguration(key="DefaultPrice", value=json.dumps(
+                {"priceText": text, "priceTextOffline": "Charger offline: charging is not available."})))
+            log.info("%s: DefaultPrice %r -> %s", cp_id, text, r.status)
+
+    async def _cost_message(self, cp_id: str, message_id: str, data: dict) -> None:
+        cp = self.points.get(cp_id)
+        if not cp or not self.display.get(cp_id):
+            return
+        try:
+            r = await cp.call(call.DataTransfer(vendor_id=COSTMSG, message_id=message_id, data=json.dumps(data)))
+            self.last_display[cp_id] = {"message": message_id, "status": str(r.status),
+                                        "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        except Exception:
+            log.exception("%s: %s failed", cp_id, message_id)
+
+    async def send_running_cost(self, tx: int, delay: float = 0) -> None:
+        if delay:
+            await asyncio.sleep(delay)      # "immediately after" StartTransaction.conf, not before it
+        t = self.db.transaction(tx)
+        if not t or not t["session_id"] or t["stopped_at"] or not self.display.get(t["charge_point"]):
+            return
+        s = self.db.session(t["session_id"])
+        readings = self.db.readings(tx)
+        free = s["payment_method"] == "manual"
+        tariff = session_tariff(s)
+        cost = Decimal(0) if free or len(readings) < 2 else self.payments.running_cost(s["id"], readings)[0]
+        at, wh = readings[-1]
+        solar = self.db.solar_active() and tariff.solar_price is not None
+        price = Decimal(0) if free else (tariff.solar_price if solar else tariff.band_at(at).price)
+        data = {"transactionId": tx, "timestamp": at.isoformat(), "meterValue": wh, "cost": float(cost),
+                "state": "Charging",
+                "chargingPrice": {"kWhPrice": float(price), "flatFee": 0.0 if free else float(tariff.session_fee)}}
+        nxt = None if free or solar else tariff.next_change(at)
+        if nxt:
+            data["nextPeriod"] = {"atTime": nxt[0].isoformat(), "chargingPrice": {"kWhPrice": float(nxt[1].price)}}
+            data["triggerMeterValue"] = {"atTime": nxt[0].isoformat()}
+        await self._cost_message(t["charge_point"], "RunningCost", data)
+
+    async def send_final_cost(self, tx: int) -> None:
+        t = self.db.transaction(tx)
+        if not t or not t["session_id"] or not self.display.get(t["charge_point"]):
+            return
+        s = self.db.session(t["session_id"])
+        kwh = (s["energy_wh"] or 0) / 1000
+        if s["payment_method"] == "manual":
+            cost, text = Decimal(0), f"{kwh:.2f} kWh. No charge. Thank you!"
+        else:
+            cost = Decimal(s["amount_charged"] or 0)
+            text = f"{kwh:.2f} kWh, total £{cost:.2f}" + (" (no energy, nothing taken)" if cost == 0 else "")
+        data = {"transactionId": tx, "cost": float(cost), "priceText": text}
+        if self.settings.public_url:
+            data["qrCodeText"] = f"{self.settings.public_url}/pay/session/{s['id']}"
+            data["priceText"] += " Scan for your receipt."
+        await self._cost_message(t["charge_point"], "FinalCost", data)
 
     def retry_settlements(self) -> None:
         """Run periodically: settle anything stopped whose payment failed (PayPal down, restart)."""

@@ -46,6 +46,9 @@ class Settings:
     admin_password: str = ""
     # Read-only JSON for Home Assistant (/api/status, LAN only), as a Bearer token.
     api_token: str = ""
+    # Price and cost on the charger's screen (OCA California pricing DataTransfer):
+    # "auto" uses it when the charger reports CustomDisplayCostAndPrice; "off" never.
+    display_prices: str = "auto"
     db_path: str = "ev.sqlite3"
     # An authorisation nobody starts charging on is voided after this long.
     unused_auth_minutes: int = 15
@@ -184,6 +187,7 @@ def from_env(env: dict[str, str] | None = None) -> Settings:
         stop_margin_wh=int(env.get("STOP_MARGIN_WH", d.stop_margin_wh)),
         admin_password=env.get("ADMIN_PASSWORD", ""),
         api_token=env.get("API_TOKEN", ""),
+        display_prices=env.get("DISPLAY_PRICES", d.display_prices),
     )
     unknown = set(s.sockets) - set(s.connectors)
     if unknown:
@@ -197,6 +201,8 @@ def from_env(env: dict[str, str] | None = None) -> Settings:
             raise ValueError(f"SOCKET_KW_/SOCKET_SHARES_ name {name} not in CONNECTORS")
     if s.public_url and not s.public_url.startswith("https://"):
         raise ValueError("PUBLIC_URL must start with https://")
+    if s.display_prices not in ("auto", "off"):
+        raise ValueError("DISPLAY_PRICES must be auto or off")
     if s.payment_methods not in ("card", "all"):
         raise ValueError("PAYMENT_METHODS must be card or all")
     if s.paypal_env not in PAYPAL_API:

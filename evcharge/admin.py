@@ -22,7 +22,7 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -129,7 +129,8 @@ def add_admin(app: FastAPI, settings: Settings, db: DB, payments: Payments, csms
     @app.get("/admin", response_class=HTMLResponse, dependencies=[Depends(guard)])
     def overview(msg: str = ""):
         sockets = "".join(
-            f"<tr><td>{html.escape(c)}</td><td>{html.escape(csms.socket_state(c))}</td>"
+            f'<tr><td><a href="/admin/chargers/{html.escape(settings.sockets[c][0])}">{html.escape(c)}</a></td>'
+            f"<td>{html.escape(csms.socket_state(c))}</td>"
             f"<td class=small>{html.escape(settings.power_label(c))}</td></tr>"
             for c in settings.connectors
         )
@@ -197,6 +198,48 @@ stops at the limit. The session is priced at the tariff for the records.</p>
         name = f"ev-charges-{month or 'all'}.csv"
         return Response(out.getvalue(), media_type="text/csv",
                         headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+    @app.get("/admin/chargers/{cp}", response_class=HTMLResponse, dependencies=[Depends(guard)])
+    def charger(cp: str, msg: str = ""):
+        if cp not in settings.charge_points:
+            raise HTTPException(404)
+        info = csms.info.get(cp, {})
+        online = cp in csms.points
+        facts = [("Connection", "online" if online else "offline"), ("Last heard from", info.get("last_seen") or "never"),
+                 ("Make", info.get("vendor") or "?"), ("Model", info.get("model") or "?"),
+                 ("Firmware", info.get("firmware") or "?"), ("Serial", info.get("serial") or "?")]
+        for socket, (p, conn) in settings.sockets.items():
+            if p == cp:
+                facts.append((f"Connector {conn} ({socket})", csms.status.get((cp, conn), "unknown")))
+        shown = csms.display.get(cp)
+        last = csms.last_display.get(cp)
+        facts.append(("Prices on its screen", ("yes" if shown else "no") + (
+            f" (last: {last['message']} → {last['status']} at {last['at']})" if last else "")))
+        table = "".join(f"<tr><th>{html.escape(k)}</th><td>{html.escape(str(v))}</td></tr>" for k, v in facts)
+        cfg = csms.config.get(cp)
+        if cfg:
+            rows = "".join(
+                f"<tr><td>{html.escape(k['key'])}</td><td>{html.escape(str(k.get('value', '')))}</td>"
+                f"<td class=small>{'read-only' if k.get('readonly') else ''}</td></tr>" for k in cfg["keys"])
+            settings_html = f"<p class=small>Read {html.escape(cfg['at'])}, {len(cfg['keys'])} settings.</p><table class=sessions>{rows}</table>"
+        else:
+            settings_html = "<p class=small>Not read yet.</p>"
+        button = (f'<form method="post" action="/admin/chargers/{html.escape(cp)}/read"><button>Read settings from the charger</button></form>'
+                  if online else "")
+        body = (f'<p class=flash>{html.escape(msg)}</p>' if msg else "") + \
+            f"<table>{table}</table><h2>Charger settings</h2>{button}{settings_html}"
+        return admin_page(f"Charger {cp}", body)
+
+    @app.post("/admin/chargers/{cp}/read", dependencies=[Depends(guard)])
+    async def charger_read(cp: str):
+        if cp not in settings.charge_points:
+            raise HTTPException(404)
+        try:
+            keys = await csms.read_configuration(cp)
+            msg = f"Read {len(keys)} settings."
+        except Exception as e:
+            msg = f"Couldn't read the settings: {e}"
+        return RedirectResponse(f"/admin/chargers/{cp}?msg={quote(msg)}", status_code=303)
 
     @app.post("/admin/authorise", dependencies=[Depends(guard)])
     async def authorise(socket: str = Form(...), amount: str = Form(...), unit: str = Form(...), note: str = Form("")):

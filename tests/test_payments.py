@@ -641,3 +641,18 @@ def test_powered_by_footer(client):
         page = client.get(path).text
         assert 'Powered by <a href="https://github.com/JR4AA/community-ev-charging"' in page
         assert page.rindex("Powered by") > page.rindex("</h1>")
+
+
+
+def test_tariff_next_change_and_description():
+    t = Tariff.parse("offpeak 00:00-16:00 0.27; peak 16:00-19:00 0.46; offpeak 19:00-24:00 0.27", session_fee=Decimal("0.30"))
+    nov = datetime(2026, 11, 2, 10, tzinfo=timezone.utc)                       # GMT
+    at, band = t.next_change(nov)
+    assert (at, band.name) == (datetime(2026, 11, 2, 16, tzinfo=timezone.utc), "peak")
+    at, band = t.next_change(datetime(2026, 11, 2, 17, tzinfo=timezone.utc))
+    assert (at, band.name) == (datetime(2026, 11, 2, 19, tzinfo=timezone.utc), "offpeak")
+    at, _ = t.next_change(datetime(2026, 7, 1, 10, tzinfo=timezone.utc))      # BST: 16:00 local is 15:00 UTC
+    assert at == datetime(2026, 7, 1, 15, tzinfo=timezone.utc)
+    assert t.next_change(datetime(2026, 11, 2, 20, tzinfo=timezone.utc))[0] == datetime(2026, 11, 3, 16, tzinfo=timezone.utc)
+    assert Tariff.flat(Decimal("0.45")).next_change(nov) is None
+    assert t.describe() == "Off-peak 27p/kWh, Peak 46p/kWh 16:00-19:00, +30p per charge"

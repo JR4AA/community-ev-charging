@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -23,6 +24,7 @@ from ocpp.v16.enums import (
     ChargePointErrorCode,
     ChargePointStatus,
     ConfigurationStatus,
+    DataTransferStatus,
     RegistrationStatus,
     RemoteStartStopStatus,
     TriggerMessageStatus,
@@ -32,7 +34,8 @@ log = logging.getLogger("simulator")
 
 
 class SimulatedCharger(OcppChargePoint):
-    def __init__(self, cp_id, connection, connector=1, kw=7.0, tick=1.0, speed=60.0, unplug_after_kwh=None):
+    def __init__(self, cp_id, connection, connector=1, kw=7.0, tick=1.0, speed=60.0, unplug_after_kwh=None,
+                 screen=True):
         super().__init__(cp_id, connection)
         self.connector = connector
         self.kw = kw
@@ -44,7 +47,11 @@ class SimulatedCharger(OcppChargePoint):
         self.transaction_id: int | None = None
         self.stop_requested = asyncio.Event()
         self.finished = asyncio.Event()
-        self.config: dict[str, str] = {}
+        self.config: dict[str, str] = {"MeterValueSampleInterval": "300", "NetworkType": "WiFi",
+                                       "WifiSignalStrength": "-61"}
+        if screen:   # a charger with the OCA price-display extension
+            self.config |= {"CustomDisplayCostAndPrice": "false", "DefaultPrice": ""}
+        self.screen: list[tuple[str, dict]] = []   # price messages received
         self._charging: asyncio.Task | None = None
 
     def now(self) -> str:
@@ -64,6 +71,21 @@ class SimulatedCharger(OcppChargePoint):
     def on_change_configuration(self, key, value):
         self.config[key] = value
         return call_result.ChangeConfiguration(status=ConfigurationStatus.accepted)
+
+    @on(Action.get_configuration)
+    def on_get_configuration(self, key=None):
+        wanted = key or list(self.config)
+        return call_result.GetConfiguration(
+            configuration_key=[{"key": k, "readonly": k in ("NetworkType", "WifiSignalStrength"), "value": self.config[k]}
+                               for k in wanted if k in self.config],
+            unknown_key=[k for k in wanted if k not in self.config] or None)
+
+    @on(Action.data_transfer)
+    def on_data_transfer(self, vendor_id, message_id=None, data=None):
+        if vendor_id != "org.openchargealliance.costmsg" or "CustomDisplayCostAndPrice" not in self.config:
+            return call_result.DataTransfer(status=DataTransferStatus.unknown_vendor_id)
+        self.screen.append((message_id, json.loads(data)))
+        return call_result.DataTransfer(status=DataTransferStatus.accepted)
 
     @on(Action.trigger_message)
     def on_trigger(self, requested_message, connector_id=None):

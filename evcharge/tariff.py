@@ -104,6 +104,31 @@ class Tariff:
             out.setdefault(b.name, (b.price, []))[1].append(span)
         return [(n, p, spans) for n, (p, spans) in out.items()]
 
+    def next_change(self, at: datetime) -> tuple[datetime, Band] | None:
+        """The next time the price changes after `at`, and the band from then; None for a flat tariff."""
+        if len({b.price for b in self.bands}) < 2:
+            return None
+        now = self.band_at(at)
+        for t in sorted(self._boundaries(at, at + timedelta(days=2))):
+            if t > at:
+                band = self.band_at(t)
+                if band.price != now.price:
+                    return t, band
+        return None
+
+    def describe(self) -> str:
+        """One line for a charger's screen, e.g. 'Off-peak 27p/kWh, peak 46p/kWh 16:00-19:00, +30p per charge'."""
+        parts = []
+        rates = self.rates()
+        usual = max(rates, key=lambda r: sum(b.end - b.start for b in self.bands if b.name == r[0]))[0]
+        for name, price, spans in sorted(rates, key=lambda r: r[1]):
+            label = {"offpeak": "Off-peak", "standard": "Price"}.get(name, name.replace("_", " ").capitalize())
+            pence = f"{(price * 100).normalize():f}p/kWh"
+            parts.append(f"{label} {pence}" + ("" if name == usual else " " + ", ".join(spans)))
+        if self.session_fee:
+            parts.append(f"+{(self.session_fee * 100).normalize():f}p per charge")
+        return ", ".join(parts)
+
     def _boundaries(self, t0: datetime, t1: datetime) -> list[datetime]:
         tz = ZoneInfo(self.tz)
         d: date = t0.astimezone(tz).date() - timedelta(days=1)
