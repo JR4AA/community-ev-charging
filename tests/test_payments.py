@@ -633,3 +633,11 @@ def test_session_remembered_on_the_phone(client):
     page = client.get(f"/pay/session/{sid}").text
     assert f'localStorage.setItem("evcharge.session", "{sid}")' in page
     assert 'id=yours' in client.get("/").text and 'id=yours' in client.get("/pay/CP2").text
+
+
+
+def test_powered_by_footer(client):
+    for path in ("/", "/pay/CP1"):
+        page = client.get(path).text
+        assert 'Powered by <a href="https://github.com/JR4AA/community-ev-charging"' in page
+        assert page.rindex("Powered by") > page.rindex("</h1>")

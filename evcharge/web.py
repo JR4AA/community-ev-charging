@@ -43,6 +43,9 @@ HOW_IT_WORKS = """<p>Each kWh is charged at the rate in force when it is deliver
 <p>PayPal holds an amount while you charge. When you finish, you pay only for
 the energy used and the rest is released. Charging stops if the cost reaches
 the amount held.</p>"""
+PROJECT_URL = "https://github.com/JR4AA/community-ev-charging"
+POWERED_BY = (f'<p class="small powered">Powered by <a href="{PROJECT_URL}" rel="noopener">'
+              'community-ev-charging</a>, open source.</p>')
 READY = "Preparing"   # cable connected, no transaction yet
 IN_USE = ("Charging", "SuspendedEV", "SuspendedEVSE", "Finishing", "Reserved")
 ORDER_ID = re.compile(r"^[A-Z0-9]{10,40}$")
@@ -390,13 +393,14 @@ def _page(title: str, body: str, settings: config.Settings, refresh: int | None 
  .flash {{ padding: .5rem .8rem; border-left: 4px solid var(--accent-ui); background: rgba(128,128,128,.15); }}
  form.admin label {{ display: block; padding: .3rem 0; }} form.admin input, form.admin select, form.admin button {{ font: inherit; }}
  table.sessions {{ font-size: .9rem; border-collapse: collapse; }} table.sessions td {{ padding: .3rem .6rem .3rem 0; border-top: 1px solid rgba(128,128,128,.3); }}
+ .powered {{ margin-top: 1.5rem; opacity: .8; }} .powered a {{ color: inherit; }}
  .note {{ font-size: .9rem; margin-top: 1.5rem; }}
  button.stop {{ font: inherit; font-weight: 600; padding: .7rem 1.4rem; border: 0; border-radius: 8px; background: #b00020; color: #fff; }}
  th {{ text-align: left; padding-right: 1rem; font-weight: 600; }} #msg {{ color: #a00; }}
  @media (prefers-color-scheme: dark) {{ :root {{ --accent-ui: color-mix(in srgb, var(--accent) 50%, white); }} body {{ color: #eee; background: #111; }} .small {{ color: #aaa; }} #msg {{ color: #f88; }} }}
 </style></head>
 <body>{header}{YOUR_SESSION}{'<p class=back><a href="/">← All sockets and prices</a></p>' if back else ""}<h1>{html.escape(title)}{f' <span class=power>{html.escape(subtitle)}</span>' if subtitle else ""}</h1>{body}
-{_note(settings.page_note) if note_at_foot else ""}{footer}</body></html>"""
+{_note(settings.page_note) if note_at_foot else ""}{footer}{POWERED_BY}</body></html>"""
 
 
 def _note(text: str) -> str:
