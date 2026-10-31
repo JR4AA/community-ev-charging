@@ -17,6 +17,7 @@ import hmac
 import html
 import io
 import json
+import logging
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -31,6 +32,8 @@ from .csms import CSMS, _is_private
 from .db import DB
 from .payments import ACTIVE, PaymentError, Payments
 from .tariff import TZ
+
+log = logging.getLogger(__name__)
 
 READY = "Preparing"
 
@@ -59,6 +62,21 @@ def add_admin(app: FastAPI, settings: Settings, db: DB, payments: Payments, csms
         scheme, _, token = request.headers.get("authorization", "").partition(" ")
         if scheme.lower() != "bearer" or not hmac.compare_digest(token.encode(), settings.api_token.encode()):
             raise HTTPException(401, headers={"WWW-Authenticate": "Bearer"})
+
+    @app.post("/api/solar", dependencies=[Depends(api_guard)])
+    async def api_solar(request: Request):
+        """Home Assistant says whether there's spare solar: {"on": true|false}.
+        While on, energy is billed at SOLAR_PRICE_PER_KWH (if set)."""
+        try:
+            on = (await request.json())["on"]
+        except (ValueError, KeyError, TypeError):
+            raise HTTPException(400, 'Send {"on": true} or {"on": false}') from None
+        if not isinstance(on, bool):
+            raise HTTPException(400, '"on" must be true or false')
+        changed = db.set_solar(on)
+        if changed:
+            log.info("solar rate %s (from Home Assistant)", "on" if on else "off")
+        return {"solar_rate_on": db.solar_active(), "changed": changed}
 
     @app.get("/api/status", dependencies=[Depends(api_guard)])
     def api_status():

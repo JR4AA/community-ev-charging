@@ -75,7 +75,9 @@
       },
       "charging": {
         "name": "Charging"
-      },
+      }
+    },
+    "switch": {
       "solar_rate": {
         "name": "Solar rate"
       }

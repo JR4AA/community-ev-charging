@@ -7,7 +7,7 @@ from homeassistant.core import HomeAssistant
 
 from .coordinator import ChargingCoordinator
 
-PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR]
+PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.SWITCH]
 
 type ChargingConfigEntry = ConfigEntry[ChargingCoordinator]
 

@@ -73,7 +73,11 @@ async def test_entities(hass, aioclient_mock):
     assert state("binary_sensor.socket_cp2_online").state == "off"
     assert state("sensor.ev_charging_energy_this_month").state == "52.3"
     assert state("sensor.ev_charging_taken_this_month").state == "14.92"
-    assert state("binary_sensor.ev_charging_solar_rate").state == "off"
+    assert state("switch.ev_charging_solar_rate").state == "off"
+    aioclient_mock.post(f"{URL}/api/solar", json={"solar_rate_on": True, "changed": True})
+    await hass.services.async_call("switch", "turn_on", {"entity_id": "switch.ev_charging_solar_rate"}, blocking=True)
+    posted = [c for c in aioclient_mock.mock_calls if c[0] == "POST"]
+    assert posted and posted[-1][2] == {"on": True} and posted[-1][3]["Authorization"] == "Bearer good"
 
     from homeassistant.helpers import device_registry as dr
     dev = dr.async_get(hass).async_get_device_by_identifier((DOMAIN, f"{entry.entry_id}_CP1"), entry.entry_id)

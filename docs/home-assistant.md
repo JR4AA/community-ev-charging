@@ -31,7 +31,7 @@ token: `API_TOKEN` in `/etc/evcharge/env`, separate from the admin password.
 `custom_components/community_ev_charging` in this repo is a Home Assistant
 integration for this endpoint: one device per socket (state, power, session
 energy and cost, online, charging) and a site device (energy today and this
-month, money taken, PayPal fees, charges, solar rate). It polls every 30 s.
+month, money taken, PayPal fees, charges, and the solar-rate switch). It polls every 30 s.
 
 1. HACS → Integrations → ⋮ → Custom repositories: add
    `https://github.com/jr4aa/community-ev-charging`, category Integration, and
@@ -45,6 +45,54 @@ Tested with `pytest-homeassistant-custom-component` against HA 2026.10:
 `uv venv --python 3.14 .venv-ha && uv pip install --python .venv-ha/bin/python
 pytest-homeassistant-custom-component`, then
 `.venv-ha/bin/python -m pytest tests_ha -o asyncio_mode=auto`.
+
+## Solar rate from Home Assistant
+
+The integration's **Solar rate** switch (`switch.ev_charging_solar_rate`) tells
+the server there's spare solar (`POST /api/solar {"on": true}`, same token).
+While it's on, energy is billed at `SOLAR_PRICE_PER_KWH`, split by time like the
+other bands; with that setting commented out the switch has no effect on prices.
+It changes the price only, not the charger's power.
+
+The rule (here: exporting at least 19 kW with the battery full) lives in HA. A
+template binary sensor holds it, with a lower threshold to turn off than to turn
+on and a 5-minute delay each way, so a passing cloud doesn't flip the price; an
+automation copies it to the switch. Replace the two source sensors with yours
+(export power in W here, battery state of charge in %):
+
+```yaml
+template:
+  - binary_sensor:
+      - name: "Spare solar"
+        unique_id: spare_solar
+        delay_on: "00:05:00"
+        delay_off: "00:05:00"
+        state: >-
+          {% set export_kw = states('sensor.grid_export_power') | float(0) / 1000 %}
+          {% set soc = states('sensor.battery_soc') | float(0) %}
+          {% if is_state('binary_sensor.spare_solar', 'on') %}
+            {{ export_kw >= 15 and soc >= 95 }}
+          {% else %}
+            {{ export_kw >= 19 and soc >= 98 }}
+          {% endif %}
+
+automation:
+  - alias: "EV solar rate follows spare solar"
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.spare_solar
+        to: ["on", "off"]
+      - trigger: homeassistant
+        event: start
+    actions:
+      - action: >-
+          {{ 'switch.turn_on' if is_state('binary_sensor.spare_solar', 'on') else 'switch.turn_off' }}
+        target:
+          entity_id: switch.ev_charging_solar_rate
+```
+
+The start trigger puts the switch right after an HA restart. If HA is down, the
+server keeps whatever it was last told.
 
 ## Or plain YAML (no integration)
 

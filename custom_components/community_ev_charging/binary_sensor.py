@@ -1,4 +1,4 @@
-"""Binary sensors: socket online and charging; the solar rate."""
+"""Binary sensors: socket online and charging."""
 from __future__ import annotations
 
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass, BinarySensorEntity
@@ -13,7 +13,7 @@ CHARGING_STATES = {"charging", "suspendedev", "suspendedevse"}
 
 async def async_setup_entry(hass: HomeAssistant, entry: ChargingConfigEntry, add: AddEntitiesCallback) -> None:
     c = entry.runtime_data
-    entities: list[BinarySensorEntity] = [SolarRate(c)]
+    entities: list[BinarySensorEntity] = []
     for socket in c.data.get("sockets", {}):
         entities += [Online(c, socket), Charging(c, socket)]
     add(entities)
@@ -44,12 +44,3 @@ class Charging(ChargingEntity, BinarySensorEntity):
     def extra_state_attributes(self) -> dict | None:
         s = self.session
         return {k: s.get(k) for k in ("kind", "started_at", "hold", "limit_kwh", "note")} if s else None
-
-
-class SolarRate(ChargingEntity, BinarySensorEntity):
-    def __init__(self, coordinator) -> None:
-        super().__init__(coordinator, "solar_rate", None)
-
-    @property
-    def is_on(self) -> bool:
-        return bool(self.coordinator.data.get("solar_rate_on"))

@@ -155,3 +155,19 @@ def test_api_status_for_home_assistant(tmp_path, fake):
         sim.close()
     with TestClient(make(tmp_path / "y", fake, api_token=""), client=LAN) as c:        # no token set: no API
         assert c.get("/api/status", headers=bearer).status_code == 404
+
+
+
+def test_api_solar_flag(tmp_path, fake):
+    app = make(tmp_path, fake, api_token="tok-abc")
+    bearer = {"Authorization": "Bearer tok-abc"}
+    with TestClient(app, client=LAN) as c:
+        assert c.post("/api/solar", json={"on": True}).status_code == 401
+        assert c.post("/api/solar", json={"on": True}, headers={**bearer, "Cf-Connecting-Ip": "203.0.113.1"}).status_code == 404
+        assert c.post("/api/solar", json={"on": "yes"}, headers=bearer).status_code == 400
+        assert c.post("/api/solar", content=b"nonsense", headers=bearer).status_code == 400
+        assert c.post("/api/solar", json={"on": True}, headers=bearer).json() == {"solar_rate_on": True, "changed": True}
+        assert c.post("/api/solar", json={"on": True}, headers=bearer).json() == {"solar_rate_on": True, "changed": False}
+        assert c.get("/api/status", headers=bearer).json()["solar_rate_on"] is True
+        assert c.post("/api/solar", json={"on": False}, headers=bearer).json()["solar_rate_on"] is False
+        assert len(app.state.payments.db.solar_periods("2000-01-01", "2100-01-01")) == 1    # one closed period recorded
