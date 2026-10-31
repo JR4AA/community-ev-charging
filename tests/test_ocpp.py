@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from evcharge.config import Settings
 from evcharge.csms import energy_readings
 from evcharge.paypal import PayPal
-from evcharge.simulator import SimulatedCharger, connect
+from evcharge.simulator import CHARGERS, connect
 from evcharge.tariff import Tariff
 from evcharge.web import create_app
 from tests.test_payments import SETTINGS, FakePayPal
@@ -22,14 +22,14 @@ from tests.test_payments import SETTINGS, FakePayPal
 class Sim:
     """A simulated charger on its own event loop thread."""
 
-    def __init__(self, port, cp_id="CP1", password=None, plug_in=True, **kw):
+    def __init__(self, port, cp_id="CP1", password=None, plug_in=True, version="1.6", **kw):
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
-        self.cp = self.run(self._open(f"ws://127.0.0.1:{port}/{cp_id}", cp_id, password, plug_in, kw))
+        self.cp = self.run(self._open(f"ws://127.0.0.1:{port}/{cp_id}", cp_id, password, plug_in, version, kw))
 
-    async def _open(self, url, cp_id, password, plug_in, kw):
-        self.ws = await connect(url, cp_id, password)
-        cp = SimulatedCharger(cp_id, self.ws, **kw)
+    async def _open(self, url, cp_id, password, plug_in, version, kw):
+        self.ws = await connect(url, cp_id, password, version)
+        cp = CHARGERS[version][0](cp_id, self.ws, **kw)
         asyncio.ensure_future(cp.start())
         if plug_in:
             await cp.boot_and_plug_in()
@@ -57,6 +57,16 @@ def fake():
     return FakePayPal()
 
 
+# The charging tests run against each kind of simulated charger.
+CHARGER_KINDS = {"1.6": {}, "2.0.1": {"version": "2.0.1"},
+                 "2.0.1, transaction from plug-in": {"version": "2.0.1", "tx_on_plug_in": True}}
+
+
+@pytest.fixture(params=list(CHARGER_KINDS))
+def kind(request):
+    return CHARGER_KINDS[request.param]
+
+
 def make_app(tmp_path, fake, **overrides):
     s = Settings(db_path=str(tmp_path / "e2e.db"), **{**SETTINGS, **overrides})
     return create_app(s, PayPal(s, transport=httpx.MockTransport(fake)))
@@ -82,13 +92,13 @@ def session(app, sid):
     return app.state.payments.db.session(sid)
 
 
-def test_plug_in_pay_charge_unplug(env, fake):
+def test_plug_in_pay_charge_unplug(env, fake, kind):
     app, client, port = env
     assert "offline" in client.get("/pay/CP1").text
-    sim = Sim(port, kw=7, tick=0.02, speed=600, unplug_after_kwh=3)
+    sim = Sim(port, kw=7, tick=0.02, speed=600, unplug_after_kwh=3, **kind)
     wait_for(lambda: app.state.csms.socket_state("CP1") == "Preparing")
     assert "intent=authorize" in client.get("/pay/CP1").text
-    wait_for(lambda: sim.cp.config.get("MeterValueSampleInterval") == "60")
+    wait_for(lambda: sim.cp.sample_interval == "60")
     sid = pay(client)
     wait_for(lambda: session(app, sid)["status"] == "CAPTURED")
     s = session(app, sid)
@@ -100,9 +110,9 @@ def test_plug_in_pay_charge_unplug(env, fake):
     sim.close()
 
 
-def test_stops_before_the_hold_runs_out(env, fake):
+def test_stops_before_the_hold_runs_out(env, fake, kind):
     app, client, port = env
-    sim = Sim(port, kw=22, tick=0.01, speed=3600)
+    sim = Sim(port, kw=22, tick=0.01, speed=3600, **kind)
     wait_for(lambda: app.state.csms.socket_state("CP1") == "Preparing")
     sid = pay(client)
     wait_for(lambda: session(app, sid)["status"] == "CAPTURED", timeout=20)
@@ -112,9 +122,9 @@ def test_stops_before_the_hold_runs_out(env, fake):
     sim.close()
 
 
-def test_driver_presses_stop(env):
+def test_driver_presses_stop(env, kind):
     app, client, port = env
-    sim = Sim(port, kw=7, tick=0.05, speed=60)
+    sim = Sim(port, kw=7, tick=0.05, speed=60, **kind)
     wait_for(lambda: app.state.csms.socket_state("CP1") == "Preparing")
     sid = pay(client)
     wait_for(lambda: session(app, sid)["status"] == "CHARGING")
@@ -138,9 +148,9 @@ def test_must_plug_in_before_paying(env):
     sim.close()
 
 
-def test_charger_refusing_start_cancels_payment(env, fake):
+def test_charger_refusing_start_cancels_payment(env, fake, kind):
     app, client, port = env
-    sim = Sim(port)
+    sim = Sim(port, **kind)
     wait_for(lambda: app.state.csms.socket_state("CP1") == "Preparing")
     sim.cp._charging = object()      # simulator now rejects remote starts
     oid = client.post("/pay/api/orders", json={"connector": "CP1"}).json()["orderID"]
@@ -164,9 +174,42 @@ def test_unknown_tag_is_refused(env):
     sim.close()
 
 
-def test_settlement_retried_after_paypal_outage(env, fake):
+def test_unknown_token_is_refused_201(env):
     app, client, port = env
-    sim = Sim(port, kw=7, tick=0.02, speed=600, unplug_after_kwh=1)
+    sim = Sim(port, version="2.0.1")
+    from ocpp.v201 import call
+    r = sim.run(sim.cp.call(call.TransactionEvent(
+        event_type="Started", timestamp="2026-11-02T10:00:00Z", trigger_reason="Authorized", seq_no=1,
+        transaction_info={"transaction_id": "x1"}, evse={"id": 1, "connector_id": 1},
+        id_token={"id_token": "NOT-A-SESSION", "type": "Central"},
+        meter_value=[{"timestamp": "2026-11-02T10:00:00Z", "sampled_value": [{"value": 5}]}])))
+    assert r.id_token_info["status"] == "Invalid"
+    assert app.state.payments.db.transaction_by_ocpp("CP1", "x1") is None
+    r = sim.run(sim.cp.call(call.Authorize(id_token={"id_token": "NOT-A-SESSION", "type": "Central"})))
+    assert r.id_token_info["status"] == "Invalid"
+    sim.close()
+
+
+def test_energy_before_payment_is_not_billed_201(env, fake):
+    """A 2.0.1 charger that starts its transaction at plug-in: only energy after payment counts."""
+    app, client, port = env
+    sim = Sim(port, kw=7, tick=0.02, speed=600, unplug_after_kwh=1, version="2.0.1", tx_on_plug_in=True)
+    wait_for(lambda: app.state.csms.socket_state("CP1") == "Preparing")
+    sim.cp.meter_wh += 5000                 # e.g. a car that drew power before anyone paid
+    sim.run(sim.cp.event("Updated", "MeterValuePeriodic", "EVConnected"))
+    assert app.state.csms.socket_state("CP1") == "Preparing"
+    sid = pay(client)
+    wait_for(lambda: session(app, sid)["status"] == "CAPTURED")
+    s = session(app, sid)
+    assert 1000 <= s["energy_wh"] < 1100
+    t = app.state.payments.db.transaction_for_session(sid)
+    assert t["ocpp_tx_id"] == sim.cp.transaction_id and t["meter_start"] == 105_000
+    sim.close()
+
+
+def test_settlement_retried_after_paypal_outage(env, fake, kind):
+    app, client, port = env
+    sim = Sim(port, kw=7, tick=0.02, speed=600, unplug_after_kwh=1, **kind)
     wait_for(lambda: app.state.csms.socket_state("CP1") == "Preparing")
     fake.fail_next["/capture"] = (503, {"name": "SERVICE_UNAVAILABLE"})
     sid = pay(client)
@@ -177,14 +220,14 @@ def test_settlement_retried_after_paypal_outage(env, fake):
     sim.close()
 
 
-def test_peak_and_offpeak_from_charger_timestamps(tmp_path, fake):
+def test_peak_and_offpeak_from_charger_timestamps(tmp_path, fake, kind):
     # Every band at the same price except peak, so the result doesn't depend on
     # when the test runs: check the breakdown names instead.
     app = make_app(tmp_path, fake, tariff=Tariff.parse(
         "offpeak 00:00-16:00 0.27; peak 16:00-19:00 0.46; offpeak 19:00-24:00 0.27"))
     with TestClient(app) as client:
         port = app.state.ocpp_server.sockets[0].getsockname()[1]
-        sim = Sim(port, kw=7, tick=0.02, speed=600, unplug_after_kwh=2)
+        sim = Sim(port, kw=7, tick=0.02, speed=600, unplug_after_kwh=2, **kind)
         wait_for(lambda: app.state.csms.socket_state("CP1") == "Preparing")
         sid = pay(client)
         wait_for(lambda: session(app, sid)["status"] == "CAPTURED")
@@ -251,6 +294,23 @@ def test_plain_ws_needs_the_charger_flag(tmp_path, fake):
     assert from_env({"OCPP_ALLOW_WS_CP2": "true", "OCPP_ALLOW_WS_CP1": "no"}).ocpp_allow_ws == {"CP2"}
 
 
+def test_protocol_version_negotiation(env):
+    app, client, port = env
+
+    async def chosen(offered):
+        async with websockets.connect(f"ws://127.0.0.1:{port}/CP2", subprotocols=offered) as ws:
+            return ws.subprotocol
+    assert asyncio.run(chosen(["ocpp1.6"])) == "ocpp1.6"
+    assert asyncio.run(chosen(["ocpp2.0.1"])) == "ocpp2.0.1"
+    assert asyncio.run(chosen(["ocpp1.6", "ocpp2.0.1"])) == "ocpp1.6"       # the charger's preference
+    assert asyncio.run(chosen(["ocpp2.1", "ocpp2.0.1", "ocpp1.6"])) == "ocpp2.0.1"
+    assert _try(port, "/CP2", subprotocols=("ocpp2.1",)) == 400
+    sim = Sim(port, version="2.0.1")
+    wait_for(lambda: app.state.csms.info.get("CP1", {}).get("protocol") == "OCPP 2.0.1")
+    assert app.state.csms.info["CP1"]["model"] == "Simulator"
+    sim.close()
+
+
 def test_private_addresses():
     from evcharge.csms import _is_private
     for ok in ("192.168.1.50", "10.1.2.3", "172.16.0.1", "172.31.255.255", "127.0.0.1", "::1", "::ffff:192.168.1.50"):
@@ -267,3 +327,10 @@ def test_energy_readings_parsing():
         {"value": "12600"},                                   # measurand defaults to energy, unit to Wh
     ]}, {"timestamp": "2026-11-02T10:01:00+01:00", "sampled_value": [{"value": "1", "location": "Inlet"}]}]
     assert energy_readings(mv) == [("2026-11-02T10:00:00+00:00", 12500), ("2026-11-02T10:00:00+00:00", 12600)]
+    # 2.0.1: numbers, with unitOfMeasure and its power-of-ten multiplier
+    mv = [{"timestamp": "2026-11-02T10:00:00Z", "sampled_value": [
+        {"value": 12.5, "unit_of_measure": {"unit": "kWh"}},
+        {"value": 12.6, "unit_of_measure": {"unit": "Wh", "multiplier": 3}},
+        {"value": 12700, "measurand": "Energy.Active.Import.Register", "context": "Transaction.End"},
+    ]}]
+    assert [wh for _, wh in energy_readings(mv)] == [12500, 12600, 12700]

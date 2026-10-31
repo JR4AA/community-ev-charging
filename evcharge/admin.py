@@ -205,7 +205,8 @@ stops at the limit. The session is priced at the tariff for the records.</p>
             raise HTTPException(404)
         info = csms.info.get(cp, {})
         online = cp in csms.points
-        facts = [("Connection", "online" if online else "offline"), ("Last heard from", info.get("last_seen") or "never"),
+        facts = [("Connection", "online" if online else "offline"), ("Protocol", info.get("protocol") or "?"),
+                 ("Last heard from", info.get("last_seen") or "never"),
                  ("Make", info.get("vendor") or "?"), ("Model", info.get("model") or "?"),
                  ("Firmware", info.get("firmware") or "?"), ("Serial", info.get("serial") or "?")]
         for socket, (p, conn) in settings.sockets.items():

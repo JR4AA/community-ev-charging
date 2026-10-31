@@ -295,8 +295,16 @@ def test_settings_from_env():
 class StubCharger:
     """Stands in for a connected charger that accepts every command (see test_ocpp for the real thing)."""
 
+    version = "1.6"
+
     async def call(self, request):
         return SimpleNamespace(status="Accepted")
+
+    async def remote_start(self, session, connector):
+        return "Accepted"
+
+    async def remote_stop(self, t):
+        return "Accepted"
 
 
 def plug_in(app, socket="CP1"):
@@ -468,7 +476,7 @@ def test_session_fee(tmp_path, fake):
 
 
 def test_upgrades_a_first_release_database(tmp_path):
-    """The sessions table as first deployed (before tariff, breakdown, id_tag)."""
+    """The tables as first deployed (before tariff, breakdown, id_tag, ocpp_tx_id)."""
     import sqlite3
     path = str(tmp_path / "old.db")
     c = sqlite3.connect(path)
@@ -478,11 +486,19 @@ def test_upgrades_a_first_release_database(tmp_path):
         amount_charged TEXT, error TEXT, created_at TEXT NOT NULL, authorized_at TEXT, started_at TEXT,
         finished_at TEXT, updated_at TEXT NOT NULL);
         INSERT INTO sessions (id, connector, status, hold_amount, price_per_kwh, created_at, updated_at)
-        VALUES ('old-session-0000000', 'CP1', 'CAPTURED', '20.00', '0.45', '2026-10-30', '2026-10-30');""")
+        VALUES ('old-session-0000000', 'CP1', 'CAPTURED', '20.00', '0.45', '2026-10-30', '2026-10-30');
+        CREATE TABLE transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, charge_point TEXT NOT NULL,
+        connector INTEGER NOT NULL, id_tag TEXT, meter_start INTEGER NOT NULL, started_at TEXT NOT NULL,
+        meter_stop INTEGER, stopped_at TEXT, stop_reason TEXT);
+        INSERT INTO transactions (session_id, charge_point, connector, meter_start, started_at)
+        VALUES ('old-session-0000000', 'CP1', 1, 5, '2026-10-30');""")
     c.close()
     db = DB(path)
     s = db.session("old-session-0000000")
     assert s["status"] == "CAPTURED" and s["id_tag"] is None and s["tariff"] is None
+    assert db.transaction(1)["ocpp_tx_id"] is None                    # added for OCPP 2.0.1
+    tx = db.start_transaction("old-session-0000000", "CP1", 1, "t", 10, "2026-10-31", ocpp_tx_id="abc")
+    assert db.transaction_by_ocpp("CP1", "abc")["id"] == tx and db.transaction_by_ocpp("CP2", "abc") is None
     DB(path)   # and again, already migrated
 
 

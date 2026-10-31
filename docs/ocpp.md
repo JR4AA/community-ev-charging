@@ -1,7 +1,12 @@
 # OCPP: the charger side
 
-`evcharge/csms.py` is an OCPP 1.6J central system (The Mobility House `ocpp`
-library), running in the same container as the pay pages.
+`evcharge/csms.py` is an OCPP central system (The Mobility House `ocpp`
+library), running in the same container as the pay pages. It speaks **1.6J**
+(`csms.py`) and **2.0.1** (`csms201.py`) on the same URL: the charger offers a
+version in its WebSocket handshake (`ocpp1.6` or `ocpp2.0.1`) and gets the
+first one it lists that the server speaks. The admin charger page shows which.
+
+The tables below are in 1.6 terms; [OCPP 2.0.1](#ocpp-201) has the differences.
 
 ## A charge
 
@@ -53,7 +58,7 @@ Port 9000 is published on the address in `OCPP_BIND`, set in `.env` beside `comp
 ## Who may connect (enforced in the app)
 
 - Only charge point ids in `SOCKETS`; anything else gets 404.
-- Only the `ocpp1.6` subprotocol (400 otherwise).
+- Only the `ocpp1.6` or `ocpp2.0.1` subprotocol (400 otherwise).
 - Encrypted: through the tunnel the charger must have used `wss://` (Cloudflare's
   `Cf-Visitor` says so; 403 otherwise). A direct, unencrypted connection is only
   accepted from an RFC 1918 or loopback address **and** for a charge point with
@@ -80,18 +85,54 @@ sends, and charges until stopped (Stop button, the hold limit, or
 `--unplug-after-kwh`). `--speed 60` runs a minute of charging per second.
 `tests/test_ocpp.py` drives the same simulator over a real websocket.
 
+## OCPP 2.0.1
+
+The same flow in 2.0.1's messages:
+
+| 1.6 | 2.0.1 |
+|---|---|
+| StatusNotification `Preparing` | StatusNotification `Occupied` (shown as Preparing while nothing is paid on that EVSE) |
+| RemoteStartTransaction / RemoteStopTransaction | RequestStartTransaction (idToken type `Central`, a `remoteStartId`) / RequestStopTransaction |
+| StartTransaction, MeterValues, StopTransaction | TransactionEvent `Started` / `Updated` / `Ended` |
+| Connector id | EVSE id (the number in `SOCKETS`, e.g. `CP1=MYCP:1`) |
+| ChangeConfiguration / GetConfiguration | SetVariables / GetBaseReport (answered in NotifyReport messages) |
+
+On connect the server sets `SampledDataCtrlr` `TxUpdatedInterval=60`, and
+`TxUpdatedMeasurands`, `TxStartedMeasurands`, `TxEndedMeasurands` to
+`Energy.Active.Import.Register`, and `TxCtrlr.StopTxOnInvalidId=true`.
+
+The charger numbers its own transactions (strings, kept in
+`transactions.ocpp_tx_id`) and may start one as soon as the cable goes in
+(`TxStartPoint`), before anyone pays. The server follows such a transaction in
+memory only. When the payment's idToken (or `remoteStartId`) arrives on it, it
+gets a row in `transactions` starting from the meter reading at that moment, so
+energy before payment is never billed. A transaction with an idToken we don't
+recognise gets `Invalid`, and the charger stops it.
+
+Settings appear on the diagnostics page as `Component.Variable`, e.g.
+`SampledDataCtrlr.TxUpdatedInterval` or `TariffCostCtrlr.Enabled[Cost]`.
+
+**Prices on the screen** use the standard `TariffCostCtrlr`, if the charger
+reports it (and `DISPLAY_PRICES` isn't `off`): the server enables `Tariff` and
+`Cost`, sets `TariffFallbackMessage` to the tariff text and `Currency`, and
+puts `totalCost` plus a line of text (`updatedPersonalMessage`, e.g. "3.20 kWh,
+£1.17 so far. Now 27p/kWh.") in its answer to every TransactionEvent. The
+`Ended` answer carries the final total.
+
+Test with `python -m evcharge.simulator … --ocpp 2.0.1`.
+
 ## Charger diagnostics
 
 `/admin/chargers/<id>` (linked from the sockets on `/admin`): online or not,
 last heard from, make, model, firmware and serial from its BootNotification,
-each connector's state, whether prices go to its screen, and every setting the
-charger reports (OCPP `GetConfiguration`, read on connect and on demand with
+each connector's state, the OCPP version, whether prices go to its screen, and every setting the
+charger reports (`GetConfiguration`, or `GetBaseReport` in 2.0.1, read on connect and on demand with
 "Read settings from the charger"). That's where network type, signal strength
 and any vendor keys show up.
 
 ## Prices on the charger's screen
 
-OCPP 1.6 has no display message, but the Open Charge Alliance's "California
+(1.6; for 2.0.1 see [above](#ocpp-201).) OCPP 1.6 has no display message, but the Open Charge Alliance's "California
 pricing" extension (whitepaper v3.1) does it with `DataTransfer`, vendor
 `org.openchargealliance.costmsg`. With `DISPLAY_PRICES=auto` (the default) the
 server uses it only when the charger reports `CustomDisplayCostAndPrice`:

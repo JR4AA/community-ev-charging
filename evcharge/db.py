@@ -54,7 +54,8 @@ CREATE TABLE IF NOT EXISTS transactions (
     started_at   TEXT NOT NULL,
     meter_stop   INTEGER,
     stopped_at   TEXT,
-    stop_reason  TEXT
+    stop_reason  TEXT,
+    ocpp_tx_id   TEXT                           -- OCPP 2.0.1: the charger's own transaction id
 );
 CREATE INDEX IF NOT EXISTS transactions_session ON transactions (session_id);
 CREATE TABLE IF NOT EXISTS meter_readings (
@@ -92,8 +93,11 @@ class DB:
         for col, kind in added.items():
             if col not in cols:
                 self._conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {kind}")
+        if "ocpp_tx_id" not in {r["name"] for r in self._conn.execute("PRAGMA table_info(transactions)")}:
+            self._conn.execute("ALTER TABLE transactions ADD COLUMN ocpp_tx_id TEXT")
         # Indexes on added columns go after the migration, or an old database fails here.
         self._conn.execute("CREATE INDEX IF NOT EXISTS sessions_id_tag ON sessions (id_tag)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS transactions_ocpp ON transactions (charge_point, ocpp_tx_id)")
         self.lock = threading.RLock()
 
     def _one(self, sql: str, *args: Any) -> dict | None:
@@ -174,12 +178,12 @@ class DB:
     # -- OCPP transactions --------------------------------------------------
 
     def start_transaction(self, session_id: str | None, charge_point: str, connector: int,
-                          id_tag: str, meter_start: int, at: str) -> int:
+                          id_tag: str, meter_start: int, at: str, ocpp_tx_id: str | None = None) -> int:
         with self.lock:
             cur = self._conn.execute(
-                "INSERT INTO transactions (session_id, charge_point, connector, id_tag, meter_start, started_at)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (session_id, charge_point, connector, id_tag, meter_start, at),
+                "INSERT INTO transactions (session_id, charge_point, connector, id_tag, meter_start, started_at,"
+                " ocpp_tx_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (session_id, charge_point, connector, id_tag, meter_start, at, ocpp_tx_id),
             )
             tx = cur.lastrowid
             if session_id:
@@ -188,6 +192,9 @@ class DB:
 
     def transaction(self, tx: int) -> dict | None:
         return self._one("SELECT * FROM transactions WHERE id = ?", tx)
+
+    def transaction_by_ocpp(self, charge_point: str, ocpp_tx_id: str) -> dict | None:
+        return self._one("SELECT * FROM transactions WHERE charge_point = ? AND ocpp_tx_id = ?", charge_point, ocpp_tx_id)
 
     def transaction_for_session(self, sid: str) -> dict | None:
         return self._one("SELECT * FROM transactions WHERE session_id = ? ORDER BY id DESC LIMIT 1", sid)

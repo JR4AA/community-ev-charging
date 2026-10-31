@@ -14,9 +14,9 @@ Drivers scan a QR code on the socket, pay by card on a web page, and charge.
 PayPal holds an amount while they charge, then takes only the cost of the
 energy they used and releases the rest.
 
-- **OCPP 1.6J central system** for the charger (built on The Mobility House
-  [`ocpp`](https://github.com/mobilityhouse/ocpp) library): starts the charger
-  after payment, reads the meter every minute, stops it before the hold runs out.
+- **OCPP central system** for the charger, 1.6J or 2.0.1, whichever it asks for
+  (built on The Mobility House [`ocpp`](https://github.com/mobilityhouse/ocpp)
+  library): starts the charger after payment, reads the meter every minute, stops it before the hold runs out.
 - **PayPal Checkout with authorise-then-capture**: card-only guest checkout by
   default, so drivers need no account and the fee is the low guest-card rate.
 - **Time-of-use pricing**: peak and off-peak bands in local time, each kWh priced
@@ -34,9 +34,9 @@ energy they used and releases the rest.
   and the PayPal webhook.
 
 ```
-charger ──OCPP 1.6J──► app :9000 (LAN, or wss via the tunnel with a password)
-                       app :8080 ◄── cloudflared ◄── drivers' phones, PayPal webhooks
-                                     only /, /pay, /static, /webhooks/paypal
+charger ──OCPP 1.6J / 2.0.1──► app :9000 (LAN, or wss via the tunnel with a password)
+                               app :8080 ◄── cloudflared ◄── drivers' phones, PayPal webhooks
+                                             only /, /pay, /static, /webhooks/paypal
 ```
 
 ## How a charge works
