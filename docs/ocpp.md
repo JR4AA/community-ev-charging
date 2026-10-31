@@ -3,8 +3,8 @@
 `evcharge/csms.py` is an OCPP central system (The Mobility House `ocpp`
 library), running in the same container as the pay pages. It speaks **1.6J**
 (`csms.py`) and **2.0.1** (`csms201.py`) on the same URL: the charger offers a
-version in its WebSocket handshake (`ocpp1.6` or `ocpp2.0.1`) and gets the
-first one it lists that the server speaks. The admin charger page shows which.
+version in its WebSocket handshake (`ocpp1.6` and/or `ocpp2.0.1`) and gets the
+newest one both sides speak. The admin charger page shows which.
 
 The tables below are in 1.6 terms; [OCPP 2.0.1](#ocpp-201) has the differences.
 

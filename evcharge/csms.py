@@ -52,7 +52,7 @@ from .payments import PaymentError, Payments, session_tariff
 log = logging.getLogger(__name__)
 
 SUBPROTOCOL = "ocpp1.6"
-SUBPROTOCOLS = ["ocpp2.0.1", SUBPROTOCOL]     # the charger's preference wins when it offers both
+SUBPROTOCOLS = ["ocpp2.0.1", SUBPROTOCOL]     # newest first: a charger offering both gets 2.0.1
 COSTMSG = "org.openchargealliance.costmsg"   # OCA "California pricing" DataTransfer vendor id
 ENERGY = "Energy.Active.Import.Register"
 OFFLINE = "Offline"
@@ -508,8 +508,8 @@ class CSMS:
 
 
 def _pick_subprotocol(connection: ServerConnection, offered) -> str | None:
-    """The first of the charger's offered OCPP versions that we speak (websockets would pick ours)."""
-    return next((p for p in offered if p in SUBPROTOCOLS), None)
+    """The newest OCPP version both sides speak, whatever order the charger lists them in."""
+    return next((p for p in SUBPROTOCOLS if p in offered), None)
 
 
 PRIVATE_NETS = [ipaddress.ip_network(n) for n in

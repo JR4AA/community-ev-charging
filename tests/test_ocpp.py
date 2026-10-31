@@ -302,7 +302,7 @@ def test_protocol_version_negotiation(env):
             return ws.subprotocol
     assert asyncio.run(chosen(["ocpp1.6"])) == "ocpp1.6"
     assert asyncio.run(chosen(["ocpp2.0.1"])) == "ocpp2.0.1"
-    assert asyncio.run(chosen(["ocpp1.6", "ocpp2.0.1"])) == "ocpp1.6"       # the charger's preference
+    assert asyncio.run(chosen(["ocpp1.6", "ocpp2.0.1"])) == "ocpp2.0.1"     # the newest, whatever the order
     assert asyncio.run(chosen(["ocpp2.1", "ocpp2.0.1", "ocpp1.6"])) == "ocpp2.0.1"
     assert _try(port, "/CP2", subprotocols=("ocpp2.1",)) == 400
     sim = Sim(port, version="2.0.1")
