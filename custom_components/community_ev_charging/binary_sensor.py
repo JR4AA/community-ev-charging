@@ -1,4 +1,4 @@
-"""Binary sensors: socket online and charging."""
+"""Binary sensors: socket online and charging, plus certificate health."""
 from __future__ import annotations
 
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass, BinarySensorEntity
@@ -16,6 +16,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ChargingConfigEntry, add
     entities: list[BinarySensorEntity] = []
     for socket in c.data.get("sockets", {}):
         entities += [Online(c, socket), Charging(c, socket)]
+    if c.data.get("tls") is not None:
+        entities.append(CertificateProblem(c))
     add(entities)
 
 
@@ -44,3 +46,25 @@ class Charging(ChargingEntity, BinarySensorEntity):
     def extra_state_attributes(self) -> dict | None:
         s = self.session
         return {k: s.get(k) for k in ("kind", "started_at", "hold", "limit_kwh", "note")} if s else None
+
+
+class CertificateProblem(ChargingEntity, BinarySensorEntity):
+    """On when the TLS endpoint the charger uses is unhealthy.
+
+    Covers an expired or untrusted certificate, the wrong name, and the
+    terminator being down - any of which stops the charger connecting.
+    """
+
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+
+    def __init__(self, coordinator) -> None:
+        super().__init__(coordinator, "certificate_problem", None)
+
+    @property
+    def is_on(self) -> bool:
+        return not (self.coordinator.data.get("tls") or {}).get("ok", False)
+
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        tls = self.coordinator.data.get("tls")
+        return {k: tls.get(k) for k in ("name", "expires", "issuer", "error") if k in tls} if tls else None

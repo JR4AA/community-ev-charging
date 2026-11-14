@@ -52,7 +52,7 @@ penny, keeps every charge above cost.
    `PAYMENT.CAPTURE.COMPLETED`, `PAYMENT.CAPTURE.PENDING`,
    `PAYMENT.CAPTURE.DENIED`, `PAYMENT.CAPTURE.REFUNDED`,
    `PAYMENT.CAPTURE.REVERSED`. Its ID goes in `PAYPAL_WEBHOOK_ID`.
-3. Test with the simulator ([ocpp.md](ocpp.md)) and a sandbox card from Testing
+3. Test with the simulator ([ocpp.md](../ocpp.md)) and a sandbox card from Testing
    Tools → Card Testing. Check the sandbox business account: one payment for
    the captured amount, nothing left held.
 4. To go live, create a **Live** app with its own credentials and webhook, set

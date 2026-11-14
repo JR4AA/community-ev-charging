@@ -15,6 +15,13 @@ OCPP 1.6 or 2.0.1, encrypted (wss:// through the tunnel; plain ws:// only direct
 private address, for chargers flagged as unable to do wss://), a per-charger password (HTTP Basic) whenever one is
 configured and always for connections arriving through the tunnel, and a
 lockout after repeated wrong passwords.
+
+A charger can be given its password over OCPP instead of by hand: the admin page opens a
+one-shot provisioning window for one charge point (PROVISION_SECONDS, in memory only). The
+first connection that fails the password check while it is open is let in, restricted to
+saying hello and being given a random password (ChangeConfiguration AuthorizationKey on 1.6,
+SetVariables SecurityCtrlr.BasicAuthPassword on 2.0.1), and the window closes the moment it
+connects. Only a digest of the password is kept (db.ocpp_credentials).
 """
 from __future__ import annotations
 
@@ -24,7 +31,10 @@ import hmac
 import ipaddress
 import json
 import logging
+import re
+import secrets
 import time
+import weakref
 from datetime import datetime, timezone
 from decimal import Decimal
 from http import HTTPStatus
@@ -58,11 +68,35 @@ ENERGY = "Energy.Active.Import.Register"
 OFFLINE = "Offline"
 LOCKOUT_FAILURES = 5
 LOCKOUT_SECONDS = 15 * 60
+PROVISION_SECONDS = 15 * 60
+PROVISION_ACCEPTED = ("Accepted", "RebootRequired")
 CONFIGURATION = {
     "MeterValueSampleInterval": "60",
     "MeterValuesSampledData": ENERGY,
     "StopTransactionOnInvalidId": "true",
 }
+# The settings OCPP 1.6 defines (core, the optional profiles and the security whitepaper) and the
+# OCA price-display ones. A charger may cap the full GetConfiguration list at GetConfigurationMaxKeys,
+# so any of these it left out are asked for by name.
+KNOWN_KEYS = (
+    "AllowOfflineTxForUnknownId", "AuthorizationCacheEnabled", "AuthorizeRemoteTxRequests", "BlinkRepeat",
+    "ClockAlignedDataInterval", "ConnectionTimeOut", "ConnectorPhaseRotation", "ConnectorPhaseRotationMaxLength",
+    "GetConfigurationMaxKeys", "HeartbeatInterval", "LightIntensity", "LocalAuthorizeOffline", "LocalPreAuthorize",
+    "MaxEnergyOnInvalidId", "MeterValuesAlignedData", "MeterValuesAlignedDataMaxLength", "MeterValuesSampledData",
+    "MeterValuesSampledDataMaxLength", "MeterValueSampleInterval", "MinimumStatusDuration", "NumberOfConnectors",
+    "ResetRetries", "StopTransactionOnEVSideDisconnect", "StopTransactionOnInvalidId", "StopTxnAlignedData",
+    "StopTxnAlignedDataMaxLength", "StopTxnSampledData", "StopTxnSampledDataMaxLength", "SupportedFeatureProfiles",
+    "SupportedFeatureProfilesMaxLength", "TransactionMessageAttempts", "TransactionMessageRetryInterval",
+    "UnlockConnectorOnEVSideDisconnect", "WebSocketPingInterval",
+    "LocalAuthListEnabled", "LocalAuthListMaxLength", "SendLocalListMaxLength",
+    "ReserveConnectorZeroSupported",
+    "ChargeProfileMaxStackLevel", "ChargingScheduleAllowedChargingRateUnit", "ChargingScheduleMaxPeriods",
+    "ConnectorSwitch3to1PhaseSupported", "MaxChargingProfilesInstalled",
+    "AdditionalRootCertificateCheck", "AuthorizationKey", "CertificateSignedMaxChainSize",
+    "CertificateStoreMaxLength", "CpoName", "SecurityProfile",
+    "CustomDisplayCostAndPrice", "DefaultPrice", "DefaultPriceText", "TimeOffset", "NextTimeOffsetTransitionDateTime",
+)
+SECRET_KEYS = ("AuthorizationKey",)        # never shown, even if a charger reports its value
 
 
 def utc_iso(ts: str | None) -> str:
@@ -119,6 +153,7 @@ class ChargePoint(OcppChargePoint):
         try:
             await self.csms.read_configuration(self.id)
             await self.csms.setup_price_display(self.id)
+            await self.csms.refresh_signal(self.id, force=True)
         except Exception:
             log.exception("%s: reading settings / price display setup failed", self.id)
 
@@ -135,6 +170,10 @@ class ChargePoint(OcppChargePoint):
 
     @on(Action.heartbeat)
     def on_heartbeat(self):
+        # The natural moment to refresh the radio strength: it is already the
+        # charger saying "still here", and the read is rate limited, so a short
+        # heartbeat interval costs nothing extra.
+        asyncio.create_task(self.csms.refresh_signal(self.id))
         return call_result.Heartbeat(current_time=datetime.now(timezone.utc).isoformat())
 
     @on(Action.status_notification)
@@ -213,9 +252,29 @@ class ChargePoint(OcppChargePoint):
         return str(r.status)
 
     async def read_settings(self) -> tuple[list[dict], list[str]]:
-        """GetConfiguration: every setting, as [{key, value, readonly}], and the unknown keys."""
+        """GetConfiguration: every setting, as [{key, value, readonly}], and the unknown keys.
+        Known settings missing from the full list are then asked for by name, in batches no
+        bigger than the charger's GetConfigurationMaxKeys."""
         r = await self.call(call.GetConfiguration())
-        return r.configuration_key or [], r.unknown_key or []
+        keys, unknown = list(r.configuration_key or []), list(r.unknown_key or [])
+        in_full_list = len(keys)
+        have = {k["key"] for k in keys}
+
+        async def by_name(names: list[str]) -> None:
+            r = await self.call(call.GetConfiguration(key=names))
+            keys.extend(k for k in r.configuration_key or [] if k["key"] not in have)
+            have.update(k["key"] for k in r.configuration_key or [])
+            unknown.extend(r.unknown_key or [])
+
+        if "GetConfigurationMaxKeys" not in have:        # the batch size, so ask for it first
+            await by_name(["GetConfigurationMaxKeys"])
+        missing = [k for k in KNOWN_KEYS if k not in have and k not in unknown]
+        batch = _max_keys(keys)
+        for i in range(0, len(missing), batch):
+            await by_name(missing[i:i + batch])
+        log.info("%s: read %d settings (%d by name); not supported: %s", self.id, len(keys),
+                 len(keys) - in_full_list, ", ".join(unknown) or "none")
+        return keys, unknown
 
     async def setup_display(self) -> bool:
         """Turn on the OCA 'California pricing' screen messages if the charger has them
@@ -239,6 +298,36 @@ class ChargePoint(OcppChargePoint):
         return True
 
 
+class ProvisioningPoint(OcppChargePoint):
+    """All a charger that connected without a password may do: say hello, and be given one.
+    Everything else gets NotImplemented from the library, so no charge can be started or billed."""
+    version = "1.6"
+
+    def __init__(self, cp_id: str, connection):
+        super().__init__(cp_id, connection)
+        self.booted = asyncio.Event()
+
+    @on(Action.boot_notification)
+    def on_boot(self, charge_point_vendor, charge_point_model, **kw):
+        log.info("%s: provisioning connection: %s %s firmware %s", self.id, charge_point_vendor, charge_point_model,
+                 kw.get("firmware_version"))
+        self.booted.set()
+        return call_result.BootNotification(
+            current_time=datetime.now(timezone.utc).isoformat(), interval=300, status=RegistrationStatus.accepted)
+
+    @on(Action.heartbeat)
+    def on_heartbeat(self):
+        return call_result.Heartbeat(current_time=datetime.now(timezone.utc).isoformat())
+
+    @on(Action.status_notification)
+    def on_status(self, **kw):
+        return call_result.StatusNotification()
+
+    async def set_password(self, password: str) -> str:
+        r = await self.call(call.ChangeConfiguration(key="AuthorizationKey", value=password))
+        return str(getattr(r.status, "value", r.status))
+
+
 class CSMS:
     def __init__(self, settings: Settings, db: DB, payments: Payments):
         self.settings = settings
@@ -248,11 +337,15 @@ class CSMS:
         self.status: dict[tuple[str, int], str] = {}
         # Per charge point: vendor, model, firmware, serial (from BootNotification), last_seen.
         self.info: dict[str, dict] = {}
+        self._signal_read: dict[str, float] = {}
         self.config: dict[str, dict] = {}         # last GetConfiguration per charge point
         self.display: dict[str, bool] = {}        # price messages on its screen?
         self.last_display: dict[str, dict] = {}   # last price message and the charger's answer
         self._failures: dict[str, list[float]] = {}
         self._stopping: set[int] = set()
+        self._provision_until: dict[str, float] = {}               # charge point -> end of its open window
+        self._provisional: weakref.WeakSet = weakref.WeakSet()    # connections let in without a password
+        self.provision_result: dict[str, dict] = {}
 
     # -- for the pay pages ---------------------------------------------------
 
@@ -299,6 +392,35 @@ class CSMS:
                 await asyncio.to_thread(self.payments.cancel, s["id"], "car unplugged before charging started")
 
     # -- money ---------------------------------------------------------------
+
+    async def refresh_signal(self, cp_id: str, force: bool = False) -> dict[str, int] | None:
+        """Re-read the charger's radio strength into info[cp_id]["signal"].
+
+        Rate limited to settings.signal_interval: a charger with a short
+        heartbeat would otherwise be asked on every beat. Never raises - a
+        charger that doesn't answer simply keeps the previous reading.
+        """
+        key = self.settings.signal_key
+        cp = self.points.get(cp_id)
+        if not key or cp is None:
+            return None
+        now = time.monotonic()
+        if not force and now - self._signal_read.get(cp_id, 0.0) < self.settings.signal_interval:
+            return None
+        self._signal_read[cp_id] = now
+        try:
+            r = await cp.call(call.GetConfiguration(key=[key]))
+        except Exception:
+            log.warning("%s: could not read %s", cp_id, key)
+            return None
+        for k in r.configuration_key or []:
+            if k["key"] == key:
+                signal = parse_signal(k.get("value") or "")
+                if signal:
+                    self.info.setdefault(cp_id, {})["signal"] = signal
+                    log.debug("%s: signal %s", cp_id, signal)
+                return signal or None
+        return None
 
     async def check_limit(self, t: dict) -> None:
         """Stop the charger before the cost reaches the hold.
@@ -426,6 +548,76 @@ class CSMS:
             except PaymentError:
                 log.warning("retry settling tx %s failed", t["id"])
 
+    # -- giving a charger its password over OCPP -------------------------------
+
+    def arm_provisioning(self, cp_id: str, seconds: int = PROVISION_SECONDS) -> None:
+        if cp_id not in self.settings.charge_points:
+            raise PaymentError(404, f"unknown charge point {cp_id}")
+        self._provision_until[cp_id] = time.monotonic() + seconds
+        log.warning("%s: provisioning window open for %d s: the next connection without a valid password "
+                    "will be given a new one", cp_id, seconds)
+
+    def disarm_provisioning(self, cp_id: str) -> None:
+        if self._provision_until.pop(cp_id, None) is not None:
+            log.info("%s: provisioning window closed", cp_id)
+
+    def provisioning_left(self, cp_id: str) -> int:
+        return max(0, int(self._provision_until.get(cp_id, 0) - time.monotonic()))
+
+    def _claim_provisioning(self, cp_id: str, connection: ServerConnection) -> bool:
+        """One shot: whichever connection gets here first while the window is open takes it."""
+        if not self.provisioning_left(cp_id):
+            self._provision_until.pop(cp_id, None)
+            return False
+        del self._provision_until[cp_id]
+        self._provisional.add(connection)
+        return True
+
+    def password_state(self, cp_id: str) -> str:
+        if self.db.has_credential(cp_id):
+            return f"set over OCPP on {self.db.credential_set_at(cp_id)}"
+        return "set in the settings file" if self.settings.ocpp_passwords.get(cp_id) else "none"
+
+    def _authorised(self, cp_id: str, header: str) -> bool:
+        env_password = self.settings.ocpp_passwords.get(cp_id)
+        if env_password and _basic_auth_ok(header, cp_id, env_password):
+            return True
+        got = _basic_credentials(header)
+        return bool(got) and hmac.compare_digest(got[0].encode(), cp_id.encode()) and self.db.credential_ok(cp_id, got[1])
+
+    async def _provision(self, connection: ServerConnection, cp_id: str) -> None:
+        source = connection.request.headers.get("Cf-Connecting-Ip") or connection.remote_address[0]
+        if connection.subprotocol == SUBPROTOCOL:
+            cp = ProvisioningPoint(cp_id, connection)
+        else:
+            from .csms201 import ProvisioningPoint201
+            cp = ProvisioningPoint201(cp_id, connection)
+        log.warning("%s: PROVISIONING connection from %s over OCPP %s (window now closed)", cp_id, source, cp.version)
+        result = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "source": source, "ok": False}
+        loop = asyncio.create_task(cp.start())
+        try:
+            try:
+                await asyncio.wait_for(cp.booted.wait(), 20)
+            except asyncio.TimeoutError:
+                log.info("%s: no BootNotification in 20 s, giving the password anyway", cp_id)
+            await asyncio.sleep(1)
+            password = secrets.token_hex(20)      # 40 hex characters: the longest the 1.6 key and the 2.0.1 variable allow
+            status = await asyncio.wait_for(cp.set_password(password), 30)
+            if status in PROVISION_ACCEPTED:
+                self.db.set_credential(cp_id, password)
+                result.update(ok=True, detail=status)
+                log.warning("%s: password set over OCPP (%s); it must reconnect with it", cp_id, status)
+            else:
+                result["detail"] = f"the charger answered {status}"
+                log.warning("%s: password NOT set: charger answered %s", cp_id, status)
+        except Exception as e:
+            result["detail"] = f"{type(e).__name__}: {e}"
+            log.exception("%s: provisioning failed", cp_id)
+        finally:
+            self.provision_result[cp_id] = result
+            await connection.close()
+            loop.cancel()
+
     # -- connections ---------------------------------------------------------
 
     async def serve(self, host: str = "0.0.0.0", port: int | None = None):
@@ -437,13 +629,17 @@ class CSMS:
 
     def _check(self, connection: ServerConnection, request: Request):
         cp_id = request.path.rstrip("/").rsplit("/", 1)[-1]
-        if cp_id not in self.settings.charge_points:
-            return connection.respond(HTTPStatus.NOT_FOUND, "Unknown charge point\n")
-        protocols = request.headers.get("Sec-WebSocket-Protocol", "")
-        if not set(SUBPROTOCOLS) & {p.strip() for p in protocols.split(",")}:
-            return connection.respond(HTTPStatus.BAD_REQUEST, "OCPP 1.6 or 2.0.1 only\n")
         tunnel_ip = request.headers.get("Cf-Connecting-Ip")
         source = tunnel_ip or str(connection.remote_address[0])
+        protocols = request.headers.get("Sec-WebSocket-Protocol", "")
+        if cp_id not in self.settings.charge_points:
+            # Logged so a new charger's own identity shows up: it picks the last part of the path.
+            log.warning("unknown charge point %r from %s (path %r, user %r, protocols %r)", cp_id, source,
+                        request.path, _basic_user(request.headers.get("Authorization", "")), protocols)
+            return connection.respond(HTTPStatus.NOT_FOUND, "Unknown charge point\n")
+        if not set(SUBPROTOCOLS) & {p.strip() for p in protocols.split(",")}:
+            log.warning("%s: refused protocols %r from %s", cp_id, protocols, source)
+            return connection.respond(HTTPStatus.BAD_REQUEST, "OCPP 1.6 or 2.0.1 only\n")
         # Encrypted by default: wss:// through the tunnel. Plain ws:// only directly
         # from a private address, and only for a charger that can't do wss://
         # (OCPP_ALLOW_WS_<id>).
@@ -456,16 +652,20 @@ class CSMS:
             return connection.respond(HTTPStatus.FORBIDDEN, "Use wss://\n")
         if self._locked(source):
             return connection.respond(HTTPStatus.TOO_MANY_REQUESTS, "Too many attempts\n")
-        password = self.settings.ocpp_passwords.get(cp_id)
-        if tunnel_ip and not password:
+        configured = bool(self.settings.ocpp_passwords.get(cp_id)) or self.db.has_credential(cp_id)
+        header = request.headers.get("Authorization", "")
+        authorised = configured and self._authorised(cp_id, header)
+        if not authorised and self._claim_provisioning(cp_id, connection):
+            return None
+        if tunnel_ip and not configured:
             log.warning("%s: tunnel connection from %s refused: no password configured", cp_id, source)
             return connection.respond(HTTPStatus.FORBIDDEN, "Forbidden\n")
-        if password and not _basic_auth_ok(request.headers.get("Authorization", ""), cp_id, password):
+        if configured and not authorised:
             # Only a wrong password counts towards the lockout: a charger set up without
             # one would otherwise lock out every charger behind the same public address.
-            if request.headers.get("Authorization"):
+            if header:
                 self._failed(source)
-            log.warning("%s: bad credentials from %s", cp_id, source)
+            log.warning("%s: bad credentials from %s (user %r)", cp_id, source, _basic_user(header))
             r = connection.respond(HTTPStatus.UNAUTHORIZED, "Unauthorized\n")
             r.headers["WWW-Authenticate"] = 'Basic realm="ocpp"'
             return r
@@ -482,6 +682,8 @@ class CSMS:
 
     async def _handler(self, connection: ServerConnection) -> None:
         cp_id = connection.request.path.rstrip("/").rsplit("/", 1)[-1]
+        if connection in self._provisional:       # never touches self.points: a real connection stays up
+            return await self._provision(connection, cp_id)
         old = self.points.get(cp_id)
         if old:
             log.info("%s: reconnected, dropping the old connection", cp_id)
@@ -512,6 +714,24 @@ def _pick_subprotocol(connection: ServerConnection, offered) -> str | None:
     return next((p for p in SUBPROTOCOLS if p in offered), None)
 
 
+def parse_signal(value: str) -> dict[str, int]:
+    """Radio strengths out of a charger's own words.
+
+    There is no OCPP key for this and no agreed format: vendors put it in a
+    free-text configuration key of their own. The Sync Energy EVPCXS222 says
+    `Modem: -71. WiFi: -88 dBm.`. So take every "<label>: <number>" pair and
+    treat the numbers as dBm, which is what these keys report in practice.
+    Numbers outside a plausible dBm range are dropped, so a key holding
+    something else yields nothing rather than nonsense.
+    """
+    out: dict[str, int] = {}
+    for label, number in re.findall(r"([A-Za-z][A-Za-z0-9 _-]*?)\s*:\s*(-?\d+)", value or ""):
+        dbm = int(number)
+        if -140 <= dbm <= 0:
+            out[label.strip().lower().replace(" ", "_")] = dbm
+    return out
+
+
 PRIVATE_NETS = [ipaddress.ip_network(n) for n in
                 ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "::1/128")]
 
@@ -535,12 +755,34 @@ def _cf_scheme(headers) -> str:
         return ""
 
 
-def _basic_auth_ok(header: str, user: str, password: str) -> bool:
+def _max_keys(keys: list[dict], default: int = 10) -> int:
+    """How many settings the charger will report per GetConfiguration request."""
+    value = next((k.get("value") for k in keys if k["key"] == "GetConfigurationMaxKeys"), None)
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _basic_credentials(header: str) -> tuple[str, str] | None:
     scheme, _, value = header.partition(" ")
     if scheme.lower() != "basic":
-        return False
+        return None
     try:
-        got_user, _, got_password = base64.b64decode(value, validate=True).decode().partition(":")
+        user, _, password = base64.b64decode(value, validate=True).decode().partition(":")
     except (ValueError, UnicodeDecodeError):
+        return None
+    return user, password
+
+
+def _basic_user(header: str) -> str | None:
+    """The user name a charger sent, for the log. Never the password."""
+    got = _basic_credentials(header)
+    return got[0] if got else None
+
+
+def _basic_auth_ok(header: str, user: str, password: str) -> bool:
+    got = _basic_credentials(header)
+    if not got:
         return False
-    return hmac.compare_digest(got_user.encode(), user.encode()) & hmac.compare_digest(got_password.encode(), password.encode())
+    return hmac.compare_digest(got[0].encode(), user.encode()) & hmac.compare_digest(got[1].encode(), password.encode())

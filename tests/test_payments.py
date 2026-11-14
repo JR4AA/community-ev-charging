@@ -672,3 +672,60 @@ def test_tariff_next_change_and_description():
     assert t.next_change(datetime(2026, 11, 2, 20, tzinfo=timezone.utc))[0] == datetime(2026, 11, 3, 16, tzinfo=timezone.utc)
     assert Tariff.flat(Decimal("0.45")).next_change(nov) is None
     assert t.describe() == "Off-peak 27p/kWh, Peak 46p/kWh 16:00-19:00, +30p per charge"
+
+
+def test_capture_asks_paypal_for_the_fee_breakdown():
+    """PayPal answers with a minimal capture unless asked for the full one.
+
+    Without `Prefer: return=representation` the response has no
+    seller_receivable_breakdown, so the fee PayPal kept is invisible and the
+    net figures on /admin/charges are overstated. This was live for the first
+    real card charge (2026-11-14): PayPal kept £0.31 of £0.46 and we recorded
+    no fee at all.
+    """
+    import httpx
+
+    from evcharge.paypal import PayPal
+    from evcharge.payments import _fee
+
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth2/token"):
+            return httpx.Response(200, json={"access_token": "t", "expires_in": 600})
+        seen[request.url.path] = dict(request.headers)
+        return httpx.Response(201, json={
+            "id": "CAP1", "status": "COMPLETED",
+            "amount": {"currency_code": "GBP", "value": "0.46"},
+            "seller_receivable_breakdown": {
+                "gross_amount": {"currency_code": "GBP", "value": "0.46"},
+                "paypal_fee": {"currency_code": "GBP", "value": "0.31"},
+                "net_amount": {"currency_code": "GBP", "value": "0.15"}},
+        })
+
+    pp = PayPal(Settings(**SETTINGS), transport=httpx.MockTransport(handler))
+    capture = pp.capture_authorization("AUTH1", amount=Decimal("0.46"),
+                                       invoice_id="INV1", request_id="r1")
+
+    path = "/v2/payments/authorizations/AUTH1/capture"
+    assert seen[path].get("prefer") == "return=representation"
+    assert _fee(capture) == "0.31"
+
+
+def test_order_creation_does_not_need_the_full_representation():
+    """Only the capture needs it; creating an order keeps the minimal reply."""
+    import httpx
+
+    from evcharge.paypal import PayPal
+
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth2/token"):
+            return httpx.Response(200, json={"access_token": "t", "expires_in": 600})
+        seen[request.url.path] = dict(request.headers)
+        return httpx.Response(201, json={"id": "ORDER1", "status": "CREATED"})
+
+    pp = PayPal(Settings(**SETTINGS), transport=httpx.MockTransport(handler))
+    pp.create_order(amount=Decimal("20.00"), reference="s1", description="d", request_id="r1")
+    assert "prefer" not in seen["/v2/checkout/orders"]

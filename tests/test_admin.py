@@ -171,3 +171,17 @@ def test_api_solar_flag(tmp_path, fake):
         assert c.get("/api/status", headers=bearer).json()["solar_rate_on"] is True
         assert c.post("/api/solar", json={"on": False}, headers=bearer).json()["solar_rate_on"] is False
         assert len(app.state.payments.db.solar_periods("2000-01-01", "2100-01-01")) == 1    # one closed period recorded
+
+
+def test_admin_opens_and_closes_the_provisioning_window(tmp_path, fake):
+    app = make(tmp_path, fake)
+    with TestClient(app, client=LAN) as c:
+        page = c.get("/admin/chargers/CP1", headers=AUTH).text
+        assert "Open the one-shot window" in page and "Now: none" in page
+        assert post(c, "/admin/chargers/CP1/provision", {}).message.endswith("Window open.")
+        assert app.state.csms.provisioning_left("CP1") > 0
+        assert "Close the window" in c.get("/admin/chargers/CP1", headers=AUTH).text
+        assert post(c, "/admin/chargers/CP1/provision/cancel", {}).message.endswith("Window closed.")
+        assert app.state.csms.provisioning_left("CP1") == 0
+        assert post(c, "/admin/chargers/NOPE/provision", {}).status_code == 404
+        assert post(c, "/admin/chargers/CP1/provision", {}, origin="http://evil.example").status_code == 403

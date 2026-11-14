@@ -27,8 +27,9 @@ from urllib.parse import quote, urlparse
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
+from . import certcheck
 from .config import Settings
-from .csms import CSMS, _is_private
+from .csms import CSMS, PROVISION_SECONDS, SECRET_KEYS, _is_private
 from .db import DB
 from .payments import ACTIVE, PaymentError, Payments
 from .tariff import TZ
@@ -115,6 +116,7 @@ def add_admin(app: FastAPI, settings: Settings, db: DB, payments: Payments, csms
             "sockets": sockets,
             "chargers": {cp: {"online": cp in csms.points, **csms.info.get(cp, {})} for cp in sorted(settings.charge_points)},
             "solar_rate_on": db.solar_active(),
+            "tls": certcheck.status(settings),
             "today": {"kwh": float(t_today["paid_kwh"] + t_today["free_kwh"]), "taken": float(t_today["paid_gross"]),
                       "charges": t_today["paid_n"] + t_today["free_n"]},
             "month": {"kwh": float(t_month["paid_kwh"] + t_month["free_kwh"]), "taken": float(t_month["paid_gross"]),
@@ -220,16 +222,53 @@ stops at the limit. The session is priced at the tariff for the records.</p>
         cfg = csms.config.get(cp)
         if cfg:
             rows = "".join(
-                f"<tr><td>{html.escape(k['key'])}</td><td>{html.escape(str(k.get('value', '')))}</td>"
+                f"<tr><td>{html.escape(k['key'])}</td><td>{html.escape(_setting_value(k))}</td>"
                 f"<td class=small>{'read-only' if k.get('readonly') else ''}</td></tr>" for k in cfg["keys"])
-            settings_html = f"<p class=small>Read {html.escape(cfg['at'])}, {len(cfg['keys'])} settings.</p><table class=sessions>{rows}</table>"
+            unknown = cfg.get("unknown") or []
+            settings_html = (f"<p class=small>Read {html.escape(cfg['at'])}, {len(cfg['keys'])} settings.</p>"
+                             f"<table class=sessions>{rows}</table>"
+                             + (f"<p class=small>Not supported: {html.escape(', '.join(unknown))}.</p>" if unknown else ""))
         else:
             settings_html = "<p class=small>Not read yet.</p>"
         button = (f'<form method="post" action="/admin/chargers/{html.escape(cp)}/read"><button>Read settings from the charger</button></form>'
                   if online else "")
         body = (f'<p class=flash>{html.escape(msg)}</p>' if msg else "") + \
-            f"<table>{table}</table><h2>Charger settings</h2>{button}{settings_html}"
+            f"<table>{table}</table>{_password_html(cp)}<h2>Charger settings</h2>{button}{settings_html}"
         return admin_page(f"Charger {cp}", body)
+
+    def _password_html(cp: str) -> str:
+        left = csms.provisioning_left(cp)
+        last = csms.provision_result.get(cp)
+        c = html.escape(cp)
+        if left:
+            action = (f"<p><b>Window open for another {left // 60} min {left % 60} s.</b> The next connection without a valid "
+                      f"password is given a new one, then the window closes.</p>"
+                      f'<form method="post" action="/admin/chargers/{c}/provision/cancel"><button>Close the window</button></form>')
+        else:
+            action = (f"<p class=small>Opens a one-shot window ({PROVISION_SECONDS // 60} minutes). Then restart or reconnect the "
+                      f"charger: the first connection that fails the password check is told a new random password over OCPP. "
+                      f"Anyone who knows the charge point id could use the window, so open it only when you are about to "
+                      f"connect the charger.</p>"
+                      f'<form method="post" action="/admin/chargers/{c}/provision"><button>Open the one-shot window</button></form>')
+        result = ""
+        if last:
+            result = (f"<p class=small>Last attempt {html.escape(last['at'])} from {html.escape(last['source'])}: "
+                      f"{'password set' if last['ok'] else 'NOT set'} ({html.escape(last.get('detail', ''))}).</p>")
+        return f"<h2>Charger password</h2><p>Now: {html.escape(csms.password_state(cp))}.</p>{action}{result}"
+
+    @app.post("/admin/chargers/{cp}/provision", dependencies=[Depends(guard)])
+    async def provision_open(cp: str):
+        if cp not in settings.charge_points:
+            raise HTTPException(404)
+        csms.arm_provisioning(cp)
+        return RedirectResponse(f"/admin/chargers/{cp}?msg={quote('Window open.')}", status_code=303)
+
+    @app.post("/admin/chargers/{cp}/provision/cancel", dependencies=[Depends(guard)])
+    async def provision_cancel(cp: str):
+        if cp not in settings.charge_points:
+            raise HTTPException(404)
+        csms.disarm_provisioning(cp)
+        return RedirectResponse(f"/admin/chargers/{cp}?msg={quote('Window closed.')}", status_code=303)
 
     @app.post("/admin/chargers/{cp}/read", dependencies=[Depends(guard)])
     async def charger_read(cp: str):
@@ -277,6 +316,12 @@ stops at the limit. The session is priced at the tariff for the records.</p>
 
 MONTH = re.compile(r"\d{4}-\d{2}")
 PAID = ("CAPTURED", "CAPTURE_PENDING")
+
+
+def _setting_value(k: dict) -> str:
+    if k["key"] in SECRET_KEYS:
+        return "(set, hidden)" if k.get("value") else ""
+    return str(k.get("value", ""))
 
 
 def _energy_value(s: dict) -> Decimal:

@@ -56,6 +56,8 @@ class SimulatedCharger(OcppChargePoint):
         if screen:   # a charger with the OCA price-display extension
             self.config |= {"CustomDisplayCostAndPrice": "false", "DefaultPrice": ""}
         self.screen: list[tuple[str, dict]] = []   # price messages received
+        self.max_keys: int | None = None           # cap on a full settings list, like some real chargers
+        self.config_requests: list[list[str] | None] = []
         self._charging: asyncio.Task | None = None
 
     def now(self) -> str:
@@ -82,7 +84,8 @@ class SimulatedCharger(OcppChargePoint):
 
     @on(Action.get_configuration)
     def on_get_configuration(self, key=None):
-        wanted = key or list(self.config)
+        self.config_requests.append(key)
+        wanted = key or list(self.config)[:self.max_keys]
         return call_result.GetConfiguration(
             configuration_key=[{"key": k, "readonly": k in ("NetworkType", "WifiSignalStrength"), "value": self.config[k]}
                                for k in wanted if k in self.config],

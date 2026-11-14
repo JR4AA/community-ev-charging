@@ -32,6 +32,9 @@ energy they used and releases the rest.
   [docs/home-assistant.md](docs/home-assistant.md).
 - One Docker Compose stack; a Cloudflare Tunnel publishes only the payment pages
   and the PayPal webhook.
+- **Notes per charger model** in [docs/chargers/](docs/chargers/). OCPP 1.6 leaves
+  a lot to the manufacturer — including, on at least one unit, a TLS stack too old
+  to reach a CDN edge at all.
 
 ```
 charger ──OCPP 1.6J / 2.0.1──► app :9000 (LAN, or wss via the tunnel with a password)
@@ -61,13 +64,17 @@ The tests run the real app and OCPP server against a fake PayPal and a simulated
 charger over a real websocket.
 
 To deploy: [docs/deploy.md](docs/deploy.md). Settings: [env.example](env.example).
-PayPal setup: [docs/paypal.md](docs/paypal.md). The charger side:
+PayPal setup: [docs/payments/paypal.md](docs/payments/paypal.md). The charger side:
 [docs/ocpp.md](docs/ocpp.md).
 
 ## Status
 
-Running in PayPal sandbox with a simulated charger. Not yet proven against a
-production charger: test with yours, and please report what you find.
+Running at one site with a real charger and live PayPal. First real card charge
+14 November 2026: authorise, meter, stop, partial capture, all as intended.
+
+That is still one site, one charger model and very little money, so treat it as
+early. Test with yours, and please report what you find — especially a page for
+[docs/chargers/](docs/chargers/) if you get another model working.
 
 Things to check for your own site before charging the public: VAT on resold
 electricity, any reduced-rate VAT or levy relief on your supply, and the Public

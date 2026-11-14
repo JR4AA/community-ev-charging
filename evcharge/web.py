@@ -102,7 +102,19 @@ class OrderRequest(BaseModel):
     hold: Decimal | None = None
 
 
+def _log_info() -> None:
+    """Our own INFO lines (charger connected, boot, settings read) in the container log: uvicorn
+    configures only its own loggers, so without this only warnings appear."""
+    ours = logging.getLogger("evcharge")
+    if not ours.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        ours.addHandler(handler)
+        ours.setLevel(logging.INFO)
+
+
 def create_app(settings: config.Settings | None = None, paypal: PayPal | None = None) -> FastAPI:
+    _log_info()
     settings = settings or config.from_env()
     db = DB(settings.db_path)
     payments = Payments(settings, db, paypal or PayPal(settings))

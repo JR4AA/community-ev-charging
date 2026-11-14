@@ -9,11 +9,14 @@ import httpx
 import pytest
 import websockets
 from fastapi.testclient import TestClient
+from ocpp.routing import on
+from ocpp.v16 import call_result
+from ocpp.v16.enums import Action
 
 from evcharge.config import Settings
 from evcharge.csms import energy_readings
 from evcharge.paypal import PayPal
-from evcharge.simulator import CHARGERS, connect
+from evcharge.simulator import CHARGERS, SimulatedCharger, connect
 from evcharge.tariff import Tariff
 from evcharge.web import create_app
 from tests.test_payments import SETTINGS, FakePayPal
@@ -284,6 +287,20 @@ def test_access_control(tmp_path, fake):
         assert _try(port, headers={**_basic("CP1", "s3cret"), "Cf-Connecting-Ip": "198.51.100.9"}) == 403
 
 
+def test_refusals_are_logged_without_passwords(tmp_path, fake, caplog):
+    app = make_app(tmp_path, fake, ocpp_passwords={"CP1": "s3cret"})
+    with TestClient(app):
+        port = app.state.ocpp_server.sockets[0].getsockname()[1]
+        assert _try(port, "/ocpp/SN12345", headers=_basic("SN12345", "hunter2")) == 404
+        assert _try(port, "/CP1", subprotocols=("ocpp2.1",)) == 400
+        assert _try(port, headers=_basic("CP9", "hunter2")) == 401
+    text = caplog.text
+    assert "unknown charge point 'SN12345'" in text and "'/ocpp/SN12345'" in text and "user 'SN12345'" in text
+    assert "CP1: refused protocols 'ocpp2.1'" in text
+    assert "CP1: bad credentials from 127.0.0.1 (user 'CP9')" in text
+    assert "hunter2" not in text
+
+
 def test_plain_ws_needs_the_charger_flag(tmp_path, fake):
     app = make_app(tmp_path, fake, ocpp_allow_ws=frozenset({"CP2"}))
     with TestClient(app):
@@ -334,3 +351,146 @@ def test_energy_readings_parsing():
         {"value": 12700, "measurand": "Energy.Active.Import.Register", "context": "Transaction.End"},
     ]}]
     assert [wh for _, wh in energy_readings(mv)] == [12500, 12600, 12700]
+
+
+# -- giving a charger its password over OCPP -----------------------------------
+
+TUNNEL = {"Cf-Connecting-Ip": "203.0.113.9", **WSS}
+PASSWORD_KEY = {"1.6": "AuthorizationKey", "2.0.1": "SecurityCtrlr.BasicAuthPassword"}
+
+
+class _Refusing(SimulatedCharger):
+    """A charger without the security extension."""
+    @on(Action.change_configuration)
+    def on_change_configuration(self, key, value):
+        return call_result.ChangeConfiguration(status="NotSupported")
+
+
+def _provisioned(port, version="1.6", headers=None, charger=None):
+    """Connect the way a charger would, say hello, and wait for the server to hang up on us."""
+    async def go():
+        ws = await websockets.connect(f"ws://127.0.0.1:{port}/CP1", subprotocols=[CHARGERS[version][1]],
+                                      additional_headers=headers or {})
+        cp = (charger or CHARGERS[version][0])("CP1", ws)
+        task = asyncio.ensure_future(cp.start())
+        await cp.boot_and_plug_in()
+        await asyncio.wait_for(ws.wait_closed(), 15)
+        task.cancel()
+        return cp
+    return asyncio.run(go())
+
+
+@pytest.mark.parametrize("version", ["1.6", "2.0.1"])
+def test_one_shot_provisioning(tmp_path, fake, caplog, version):
+    app = make_app(tmp_path, fake)
+    with TestClient(app):
+        port, csms = app.state.ocpp_server.sockets[0].getsockname()[1], app.state.csms
+        assert _try(port, "/CP1", headers=TUNNEL) == 403                  # nothing configured, window shut
+        csms.arm_provisioning("CP1")
+        assert csms.provisioning_left("CP1") > 800
+        cp = _provisioned(port, version, headers=TUNNEL)
+        key = cp.config[PASSWORD_KEY[version]]
+        assert len(key) == 40 and int(key, 16) >= 0
+        assert csms.provisioning_left("CP1") == 0                         # one shot: used up
+        assert csms.provision_result["CP1"]["ok"] and csms.password_state("CP1").startswith("set over OCPP")
+        assert "CP1" not in csms.points                                   # it was never a real connection
+        assert _try(port, "/CP1", headers=TUNNEL) == 401                  # now a password is needed
+        assert _try(port, "/CP1", headers={**TUNNEL, **_basic("CP1", "0" * 40)}) == 401
+        assert _try(port, "/CP1", headers={**TUNNEL, **_basic("CP1", key)}) == 101
+        assert _try(port, "/CP1", headers={**TUNNEL, **_basic("CP2", key)}) == 401
+        assert csms.db._one("SELECT digest FROM ocpp_credentials")["digest"] != key    # only a digest is kept
+    assert key not in caplog.text
+
+
+def test_provisioning_window_is_shut_by_default_and_by_choice(tmp_path, fake):
+    app = make_app(tmp_path, fake)
+    with TestClient(app):
+        port, csms = app.state.ocpp_server.sockets[0].getsockname()[1], app.state.csms
+        csms.arm_provisioning("CP1", seconds=0)                           # already over
+        assert _try(port, "/CP1", headers=TUNNEL) == 403
+        csms.arm_provisioning("CP1")
+        csms.disarm_provisioning("CP1")
+        assert _try(port, "/CP1", headers=TUNNEL) == 403
+        with pytest.raises(Exception):
+            csms.arm_provisioning("NOPE")
+
+
+def test_charger_without_the_extension_gets_no_password(tmp_path, fake):
+    app = make_app(tmp_path, fake)
+    with TestClient(app):
+        port, csms = app.state.ocpp_server.sockets[0].getsockname()[1], app.state.csms
+        csms.arm_provisioning("CP1")
+        _provisioned(port, headers=TUNNEL, charger=_Refusing)
+        result = csms.provision_result["CP1"]
+        assert not result["ok"] and "NotSupported" in result["detail"]
+        assert not csms.db.has_credential("CP1")
+        assert csms.provisioning_left("CP1") == 0                         # the shot was spent; open it again to retry
+        assert _try(port, "/CP1", headers=TUNNEL) == 403
+
+
+def test_provisioning_beside_a_password_from_the_settings_file(tmp_path, fake):
+    app = make_app(tmp_path, fake, ocpp_passwords={"CP1": "old-pass"})
+    with TestClient(app):
+        port, csms = app.state.ocpp_server.sockets[0].getsockname()[1], app.state.csms
+        csms.arm_provisioning("CP1")
+        assert _try(port, "/CP1", headers={**TUNNEL, **_basic("CP1", "old-pass")}) == 101   # a good password doesn't use the shot
+        assert csms.provisioning_left("CP1") > 0
+        cp = _provisioned(port, headers={**TUNNEL, **_basic("CP1", "wrong")})       # a wrong one does
+        key = cp.config["AuthorizationKey"]
+        assert _try(port, "/CP1", headers={**TUNNEL, **_basic("CP1", key)}) == 101
+        assert _try(port, "/CP1", headers={**TUNNEL, **_basic("CP1", "old-pass")}) == 101
+        assert _try(port, "/CP1", headers=TUNNEL) == 401
+
+
+def test_parse_signal_reads_a_chargers_own_words():
+    """Vendors report radio strength in a free-text key, with no agreed format."""
+    from evcharge.csms import parse_signal
+
+    # Sync Energy EVPCXS222's OEM_RSSI
+    assert parse_signal("Modem: -71. WiFi: -88 dBm.") == {"modem": -71, "wifi": -88}
+    # other plausible shapes
+    assert parse_signal("LTE: -95 dBm") == {"lte": -95}
+    assert parse_signal("Wi-Fi: -40, Modem: -120") == {"wi-fi": -40, "modem": -120}
+    # a key that holds something else entirely yields nothing, not nonsense
+    assert parse_signal("ChargerMode: 1") == {}
+    assert parse_signal("MaxCurrent: 32") == {}
+    assert parse_signal("") == {} and parse_signal(None) == {}
+    # out-of-range numbers are not signal strengths
+    assert parse_signal("Uptime: -99999") == {}
+
+
+def test_signal_refresh_is_rate_limited(tmp_path, fake):
+    """A short heartbeat interval must not mean a GetConfiguration per beat."""
+    import asyncio as _asyncio
+
+    from evcharge.config import Settings
+    from evcharge.csms import CSMS
+    from evcharge.db import DB
+
+    class FakeCP:
+        def __init__(self): self.calls = 0
+        async def call(self, msg):
+            self.calls += 1
+            class R: configuration_key = [{"key": "OEM_RSSI", "value": "Modem: -71. WiFi: -88 dBm."}]
+            return R()
+
+    s = Settings(db_path=str(tmp_path / "s.db"), **{**SETTINGS, "signal_key": "OEM_RSSI",
+                                                    "signal_interval": 300})
+    csms = CSMS(s, DB(s.db_path), None)
+    cp = FakeCP()
+    csms.points["CP1"] = cp
+
+    async def go():
+        assert await csms.refresh_signal("CP1") == {"modem": -71, "wifi": -88}
+        assert csms.info["CP1"]["signal"] == {"modem": -71, "wifi": -88}
+        assert await csms.refresh_signal("CP1") is None      # inside the interval
+        assert await csms.refresh_signal("CP1", force=True)  # forced anyway
+    _asyncio.run(go())
+    assert cp.calls == 2
+
+    # with no key configured nothing is read at all
+    s2 = Settings(db_path=str(tmp_path / "t.db"), **SETTINGS)
+    csms2 = CSMS(s2, DB(s2.db_path), None)
+    csms2.points["CP1"] = cp
+    assert _asyncio.run(csms2.refresh_signal("CP1")) is None
+    assert cp.calls == 2

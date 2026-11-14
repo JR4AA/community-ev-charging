@@ -313,3 +313,35 @@ class ChargePoint201(OcppChargePoint):
     @on(Action.data_transfer)
     def on_data_transfer(self, vendor_id, **kw):
         return call_result.DataTransfer(status="UnknownVendorId")
+
+
+class ProvisioningPoint201(OcppChargePoint):
+    """2.0.1 twin of csms.ProvisioningPoint: a charger that connected without a password may
+    say hello and be given one (SecurityCtrlr.BasicAuthPassword), and can do nothing else."""
+    version = "2.0.1"
+
+    def __init__(self, cp_id: str, connection):
+        super().__init__(cp_id, connection)
+        self.booted = asyncio.Event()
+
+    @on(Action.boot_notification)
+    def on_boot(self, charging_station, reason, **kw):
+        log.info("%s: provisioning connection (%s): %s %s firmware %s", self.id, reason, charging_station.get("vendor_name"),
+                 charging_station.get("model"), charging_station.get("firmware_version"))
+        self.booted.set()
+        return call_result.BootNotification(
+            current_time=datetime.now(timezone.utc).isoformat(), interval=300, status="Accepted")
+
+    @on(Action.heartbeat)
+    def on_heartbeat(self):
+        return call_result.Heartbeat(current_time=datetime.now(timezone.utc).isoformat())
+
+    @on(Action.status_notification)
+    def on_status(self, **kw):
+        return call_result.StatusNotification()
+
+    async def set_password(self, password: str) -> str:
+        r = await self.call(call.SetVariables(set_variable_data=[
+            {"attribute_value": password, "component": {"name": "SecurityCtrlr"},
+             "variable": {"name": "BasicAuthPassword"}}]))
+        return str(r.set_variable_result[0]["attribute_status"])

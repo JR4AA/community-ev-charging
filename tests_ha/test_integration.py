@@ -90,3 +90,67 @@ async def test_entities(hass, aioclient_mock):
     await hass.async_block_till_done()
     assert any(f["context"]["source"] == "reauth" for f in hass.config_entries.flow.async_progress())
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_certificate_entities(hass, aioclient_mock):
+    """The certificate watch surfaces as a days-left sensor and a problem flag."""
+    healthy = {**STATUS, "tls": {"ok": True, "name": "ocpp.example.org", "days_left": 61,
+                                 "expires": "2027-02-12T09:05:55+00:00", "issuer": "Let's Encrypt"}}
+    aioclient_mock.get(f"{URL}/api/status", json=healthy)
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=URL, data={CONF_URL: URL, CONF_TOKEN: "good"})
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    days = hass.states.get("sensor.ev_charging_certificate_days_left")
+    assert days is not None, f"missing; have {sorted(hass.states.async_entity_ids('sensor'))}"
+    assert days.state == "61"
+    problem = hass.states.get("binary_sensor.ev_charging_certificate_problem")
+    assert problem is not None and problem.state == "off"
+    assert problem.attributes["issuer"] == "Let's Encrypt"
+
+    # Endpoint unreachable or certificate bad: the problem flag goes on and
+    # carries the reason, while days-left becomes unknown.
+    aioclient_mock.clear_requests()
+    aioclient_mock.get(f"{URL}/api/status", json={**STATUS, "tls": {"ok": False, "name": "ocpp.example.org",
+                                                                    "error": "SSLCertVerificationError: expired"}})
+    await entry.runtime_data.async_refresh()
+    await hass.async_block_till_done()
+    assert hass.states.get("binary_sensor.ev_charging_certificate_problem").state == "on"
+    assert "expired" in hass.states.get("binary_sensor.ev_charging_certificate_problem").attributes["error"]
+    assert hass.states.get("sensor.ev_charging_certificate_days_left").state in ("unknown", "unavailable")
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_no_certificate_entities_when_check_is_off(hass, aioclient_mock):
+    """With TLS_CHECK unset the server sends tls: null and no entities appear."""
+    aioclient_mock.get(f"{URL}/api/status", json={**STATUS, "tls": None})
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=URL, data={CONF_URL: URL, CONF_TOKEN: "good"})
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert hass.states.get("binary_sensor.ev_charging_certificate_problem") is None
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_signal_sensors(hass, aioclient_mock):
+    """Radio strength appears once per charge point, not once per socket."""
+    status = {**STATUS}
+    status["chargers"] = {**STATUS["chargers"]}
+    # CP1 and CP2 are separate charge points in STATUS; give one a signal.
+    status["chargers"]["CP1"] = {**STATUS["chargers"]["CP1"], "signal": {"modem": -71, "wifi": -88}}
+    aioclient_mock.get(f"{URL}/api/status", json=status)
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=URL, data={CONF_URL: URL, CONF_TOKEN: "good"})
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    modem = hass.states.get("sensor.socket_cp1_modem_signal")
+    wifi = hass.states.get("sensor.socket_cp1_wi_fi_signal")
+    assert modem is not None, f"missing; have {sorted(hass.states.async_entity_ids('sensor'))}"
+    assert modem.state == "-71" and wifi.state == "-88"
+    assert modem.attributes["unit_of_measurement"] == "dBm"
+    assert modem.attributes["device_class"] == "signal_strength"
+    # the charge point without a signal gets no sensors
+    assert hass.states.get("sensor.socket_cp2_modem_signal") is None
+    assert await hass.config_entries.async_unload(entry.entry_id)

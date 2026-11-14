@@ -31,7 +31,8 @@ token: `API_TOKEN` in `/etc/evcharge/env`, separate from the admin password.
 `custom_components/community_ev_charging` in this repo is a Home Assistant
 integration for this endpoint: one device per socket (state, power, session
 energy and cost, online, charging) and a site device (energy today and this
-month, money taken, PayPal fees, charges, and the solar-rate switch). It polls every 30 s.
+month, money taken, PayPal fees, charges and the solar-rate switch), plus - when
+configured - certificate and radio-signal sensors. It polls every 30 s.
 
 1. HACS → Integrations → ⋮ → Custom repositories: add
    `https://github.com/jr4aa/community-ev-charging`, category Integration, and
@@ -93,6 +94,92 @@ automation:
 
 The start trigger puts the switch right after an HA restart. If HA is down, the
 server keeps whatever it was last told.
+
+## Radio signal strength
+
+Some chargers report how good their mobile or Wi-Fi signal is, in a
+vendor-specific configuration key. There is no OCPP key for it and no agreed
+format, so you name the key and the value is parsed for `label: number` pairs:
+
+```
+SIGNAL_KEY=OEM_RSSI        # the Sync Energy EVPCXS222's key; unset = off
+SIGNAL_INTERVAL=300        # optional, seconds; re-read no more often than this
+```
+
+On the EVPCXS222 that key reads `Modem: -71. WiFi: -88 dBm.`, which becomes:
+
+```json
+"chargers": {"<id>": {"signal": {"modem": -71, "wifi": -88}, ...}}
+```
+
+It is read when the charger connects and refreshed on its heartbeats, rate
+limited to `SIGNAL_INTERVAL` so a charger with a short heartbeat is not asked
+every beat. A charger that does not answer keeps its previous reading.
+
+In Home Assistant each radio becomes a sensor on the charge point's first
+socket device - `sensor.socket_<name>_modem_signal`,
+`sensor.socket_<name>_wi_fi_signal` - with device class `signal_strength` in
+dBm, so they chart and can be alerted on like any other signal.
+
+This is worth having where the charger is at the edge of the Wi-Fi: a link that
+is merely weak rather than dead shows up as dropped sessions and repeated DHCP,
+and the numbers tell you whether the mobile radio would do better.
+
+## Watching the charger's TLS certificate
+
+The charger reaches the server over `wss://`, so if that certificate lapses the
+charger silently stops connecting. Two failures are possible and only one is
+visible on disk: the certificate not renewing, and it renewing while the TLS
+terminator carries on serving the old one. So the check connects to the
+endpoint and reads the certificate actually served.
+
+Set in the server's env:
+
+```
+TLS_CHECK=ocpp.example.org          # the name on the certificate
+TLS_CHECK_ADDR=192.168.0.10          # optional: where to dial, if that name
+                                    # only resolves on the site's own DNS
+TLS_CHECK_PORT=443                  # optional, default 443
+```
+
+`/api/status` then carries:
+
+```json
+"tls": {"ok": true, "name": "ocpp.example.org", "expires": "2027-02-12T09:05:55+00:00",
+        "days_left": 61, "issuer": "Let's Encrypt"}
+```
+
+`ok` is false — with an `error` — if the certificate has expired, is untrusted,
+is for the wrong name, or the endpoint is down. Leave `TLS_CHECK` unset and
+`tls` is `null` and no entities appear. The result is cached for an hour
+(five minutes after a failure), so a 30-second poll doesn't mean a handshake
+every 30 seconds.
+
+In the integration this is `sensor.ev_charging_certificate_days_left` and
+`binary_sensor.ev_charging_certificate_problem`. A useful alert:
+
+```yaml
+automation:
+  - alias: "EV charger certificate needs attention"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.ev_charging_certificate_problem
+        to: "on"
+        for: "01:00:00"
+      - platform: numeric_state
+        entity_id: sensor.ev_charging_certificate_days_left
+        below: 21
+    action:
+      - service: notify.persistent_notification
+        data:
+          title: "EV charger certificate"
+          message: >
+            {{ state_attr('binary_sensor.ev_charging_certificate_problem', 'error')
+               or states('sensor.ev_charging_certificate_days_left') ~ ' days left' }}
+```
+
+Renewal itself is certbot's job (`certbot.timer`), with a deploy hook to reload
+the terminator; this only tells you when that has stopped working.
 
 ## Or plain YAML (no integration)
 

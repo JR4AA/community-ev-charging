@@ -52,11 +52,16 @@ class PayPal:
         self._token_expires = time.monotonic() + int(body.get("expires_in", 300)) - 60
         return self._token
 
-    def _call(self, method: str, path: str, json: Any = None, request_id: str | None = None) -> dict:
+    def _call(self, method: str, path: str, json: Any = None, request_id: str | None = None,
+              full: bool = False) -> dict:
         for attempt in (0, 1):
             headers = {"Authorization": f"Bearer {self._access_token(refresh=attempt > 0)}"}
             if request_id:
                 headers["PayPal-Request-Id"] = request_id
+            if full:
+                # Without this PayPal answers with a minimal object - id, status, links -
+                # and omits seller_receivable_breakdown, so the fee it kept is invisible.
+                headers["Prefer"] = "return=representation"
             r = self._http.request(method, path, json=json, headers=headers)
             if r.status_code == 401 and attempt == 0:
                 continue  # token revoked or expired early
@@ -87,7 +92,8 @@ class PayPal:
         return order["purchase_units"][0]["payments"]["authorizations"][0]
 
     def capture_authorization(self, auth_id: str, *, amount: Decimal, invoice_id: str, request_id: str) -> dict:
-        return self._call("POST", f"/v2/payments/authorizations/{auth_id}/capture", request_id=request_id, json={
+        return self._call("POST", f"/v2/payments/authorizations/{auth_id}/capture", request_id=request_id,
+                          full=True, json={
             "amount": _amount(self.settings.currency, amount),
             "invoice_id": invoice_id,
             "final_capture": True,

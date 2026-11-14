@@ -67,6 +67,21 @@
       },
       "month_charges": {
         "name": "Charges this month"
+      },
+      "certificate_days": {
+        "name": "Certificate days left"
+      },
+      "signal_modem": {
+        "name": "Modem signal"
+      },
+      "signal_wifi": {
+        "name": "Wi-Fi signal"
+      },
+      "signal_ethernet": {
+        "name": "Ethernet signal"
+      },
+      "signal_lte": {
+        "name": "LTE signal"
       }
     },
     "binary_sensor": {
@@ -75,6 +90,9 @@
       },
       "charging": {
         "name": "Charging"
+      },
+      "certificate_problem": {
+        "name": "Certificate problem"
       }
     },
     "switch": {

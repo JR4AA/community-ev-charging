@@ -1,6 +1,9 @@
 """SQLite store for charging sessions. One process, so one connection behind a lock."""
 from __future__ import annotations
 
+import hashlib
+import hmac
+import secrets
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -73,6 +76,12 @@ CREATE TABLE IF NOT EXISTS webhook_events (
     event_type  TEXT NOT NULL,
     resource_id TEXT,
     received_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ocpp_credentials (
+    charge_point TEXT PRIMARY KEY,
+    salt         TEXT NOT NULL,                 -- the password itself is never stored, only this digest
+    digest       TEXT NOT NULL,
+    set_at       TEXT NOT NULL
 );
 """
 
@@ -245,6 +254,30 @@ class DB:
         )
         return [(datetime.fromisoformat(r["started_at"]), r["ended_at"] and datetime.fromisoformat(r["ended_at"]))
                 for r in rows]
+
+    # -- passwords the charger was given over OCPP (see CSMS.arm_provisioning) -----
+
+    @staticmethod
+    def _digest(salt: str, password: str) -> str:
+        return hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()    # random 160-bit passwords: no need to stretch
+
+    def set_credential(self, charge_point: str, password: str) -> None:
+        salt = secrets.token_hex(8)
+        with self.lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO ocpp_credentials (charge_point, salt, digest, set_at) VALUES (?, ?, ?, ?)",
+                (charge_point, salt, self._digest(salt, password), now()))
+
+    def has_credential(self, charge_point: str) -> bool:
+        return self._one("SELECT 1 AS x FROM ocpp_credentials WHERE charge_point = ?", charge_point) is not None
+
+    def credential_set_at(self, charge_point: str) -> str | None:
+        row = self._one("SELECT set_at FROM ocpp_credentials WHERE charge_point = ?", charge_point)
+        return row and row["set_at"]
+
+    def credential_ok(self, charge_point: str, password: str) -> bool:
+        row = self._one("SELECT salt, digest FROM ocpp_credentials WHERE charge_point = ?", charge_point)
+        return bool(row) and hmac.compare_digest(row["digest"], self._digest(row["salt"], password))
 
     def record_webhook(self, event_id: str, event_type: str, resource_id: str | None) -> bool:
         """False if this event was seen before."""

@@ -46,6 +46,19 @@ class Settings:
     admin_password: str = ""
     # Read-only JSON for Home Assistant (/api/status, LAN only), as a Bearer token.
     api_token: str = ""
+    # The wss:// endpoint the charger connects to, watched so a certificate that
+    # fails to renew - or renews without the terminator reloading - is visible in
+    # /api/status rather than discovered when the charger drops off.
+    # TLS_CHECK is the certificate's hostname; TLS_CHECK_ADDR is where to dial it
+    # if that name doesn't resolve here (it may exist only on the site's own DNS).
+    # A charger that reports radio signal strength in a (vendor-specific)
+    # configuration key, e.g. OEM_RSSI = "Modem: -71. WiFi: -88 dBm." on the
+    # Sync Energy EVPCXS222. Unset, nothing is read and nothing is reported.
+    signal_key: str = ""
+    signal_interval: int = 300          # seconds; it is re-read no more often than this
+    tls_check_name: str = ""
+    tls_check_addr: str = ""
+    tls_check_port: int = 443
     # Price and cost on the charger's screen (OCA California pricing DataTransfer):
     # "auto" uses it when the charger reports CustomDisplayCostAndPrice; "off" never.
     display_prices: str = "auto"
@@ -187,6 +200,11 @@ def from_env(env: dict[str, str] | None = None) -> Settings:
         stop_margin_wh=int(env.get("STOP_MARGIN_WH", d.stop_margin_wh)),
         admin_password=env.get("ADMIN_PASSWORD", ""),
         api_token=env.get("API_TOKEN", ""),
+        signal_key=env.get("SIGNAL_KEY", "").strip(),
+        signal_interval=int(env.get("SIGNAL_INTERVAL", d.signal_interval)),
+        tls_check_name=env.get("TLS_CHECK", "").strip(),
+        tls_check_addr=env.get("TLS_CHECK_ADDR", "").strip() or env.get("TLS_CHECK", "").strip(),
+        tls_check_port=int(env.get("TLS_CHECK_PORT", d.tls_check_port)),
         display_prices=env.get("DISPLAY_PRICES", d.display_prices),
     )
     unknown = set(s.sockets) - set(s.connectors)
@@ -201,6 +219,8 @@ def from_env(env: dict[str, str] | None = None) -> Settings:
             raise ValueError(f"SOCKET_KW_/SOCKET_SHARES_ name {name} not in CONNECTORS")
     if s.public_url and not s.public_url.startswith("https://"):
         raise ValueError("PUBLIC_URL must start with https://")
+    if s.tls_check_name and ("/" in s.tls_check_name or ":" in s.tls_check_name):
+        raise ValueError("TLS_CHECK is a hostname only; use TLS_CHECK_PORT for the port")
     if s.display_prices not in ("auto", "off"):
         raise ValueError("DISPLAY_PRICES must be auto or off")
     if s.payment_methods not in ("card", "all"):

@@ -30,7 +30,7 @@ def test_prices_on_a_charger_with_a_screen(tmp_path, fake):
     app, c, sim = start(tmp_path, fake)
     sim.cp.unplug_after_wh = 2000
     wait_for(lambda: sim.cp.config["CustomDisplayCostAndPrice"] == "true")
-    assert app.state.csms.display["CP1"]
+    wait_for(lambda: app.state.csms.display.get("CP1"))     # recorded after the charger has answered
     sid = pay(c)
     db = app.state.payments.db
     wait_for(lambda: db.session(sid)["status"] == "CAPTURED")
@@ -86,7 +86,8 @@ def test_prices_on_a_201_charger_with_a_screen(tmp_path, fake):
     app, c, sim = start(tmp_path, fake, version="2.0.1")
     sim.cp.unplug_after_wh = 2000
     wait_for(lambda: sim.cp.config["TariffCostCtrlr.Enabled[Cost]"] == "true")
-    assert app.state.csms.display["CP1"] and sim.cp.config["TariffCostCtrlr.Enabled[Tariff]"] == "true"
+    wait_for(lambda: app.state.csms.display.get("CP1"))     # recorded after the charger has answered
+    assert sim.cp.config["TariffCostCtrlr.Enabled[Tariff]"] == "true"
     assert sim.cp.config["TariffCostCtrlr.Currency"] == "GBP"
     assert "45p/kWh" in sim.cp.config["TariffCostCtrlr.TariffFallbackMessage"]
     sid = pay(c)
@@ -159,6 +160,25 @@ def test_admin_charger_page(tmp_path, fake):
     assert c.get("/admin/chargers/NOPE", headers=AUTH).status_code == 404
     assert c.get("/admin/chargers/CP1").status_code == 401
     assert "Protocol</th><td>OCPP 1.6" in page
+    sim.close()
+    c.__exit__(None, None, None)
+
+
+def test_settings_left_out_of_a_capped_list_are_read_by_name(tmp_path, fake):
+    app, c, sim = start(tmp_path, fake)
+    sim.cp.config |= {"GetConfigurationMaxKeys": "3", "AuthorizationKey": "s3cret-key", "SecurityProfile": "0",
+                      "NumberOfConnectors": "2"}
+    sim.cp.max_keys, sim.cp.config_requests = 3, []
+    r = post(c, "/admin/chargers/CP1/read", {})
+    assert "Read" in r.message
+    got = {k["key"]: k["value"] for k in app.state.csms.config["CP1"]["keys"]}
+    assert set(got) == set(sim.cp.config)                       # all of them, though a full list gives only 3
+    assert sim.cp.config_requests[0] is None and all(len(k) <= 3 for k in sim.cp.config_requests[1:])
+    unknown = app.state.csms.config["CP1"]["unknown"]
+    assert "WebSocketPingInterval" in unknown and "SecurityProfile" not in unknown
+    page = c.get("/admin/chargers/CP1", headers=AUTH).text
+    assert "SecurityProfile</td><td>0" in page and "Not supported:" in page and "WebSocketPingInterval" in page
+    assert "AuthorizationKey</td><td>(set, hidden)" in page and "s3cret-key" not in page
     sim.close()
     c.__exit__(None, None, None)
 

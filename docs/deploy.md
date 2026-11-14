@@ -11,7 +11,7 @@ sudo install -d -m 700 /etc/evcharge
 sudo install -m 600 env.example /etc/evcharge/env        # then edit it
 sudo install -d -m 755 /etc/evcharge/brand               # optional: logo for BRAND_LOGO
 sudo install -d -m 700 -o 10001 -g 10001 /var/lib/evcharge
-echo "OCPP_BIND=192.168.1.20" > .env                     # this host's LAN address
+echo "OCPP_BIND=192.168.0.10" > .env                     # this host's LAN address
 ```
 
 10001 is the user the app runs as in its container.
@@ -60,7 +60,7 @@ Every line of the check should say `ok`.
   ([ocpp.md](ocpp.md)) and a sandbox card.
 - Point the real charger at the app and do a sandbox charge with a real car.
 - Back up `/var/lib/evcharge` (the session database) and `/etc/evcharge`.
-- Then switch to a Live PayPal app ([paypal.md](paypal.md)).
+- Then switch to a Live PayPal app ([paypal.md](payments/paypal.md)).
 
 ## Operating
 
