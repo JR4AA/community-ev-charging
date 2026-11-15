@@ -86,10 +86,15 @@ class PayPal:
             },
         })
 
-    def authorize_order(self, order_id: str, *, request_id: str) -> dict:
-        """Returns the authorization object (id, status, expiration_time, amount)."""
+    def authorize_order(self, order_id: str, *, request_id: str) -> tuple[dict, str]:
+        """The authorization (id, status, expiration_time, amount), and the payer's email.
+
+        The address is returned rather than kept: the caller stores it only if it
+        is going to send a receipt, and clears it once the charge has settled.
+        """
         order = self._call("POST", f"/v2/checkout/orders/{order_id}/authorize", json={}, request_id=request_id)
-        return order["purchase_units"][0]["payments"]["authorizations"][0]
+        auth = order["purchase_units"][0]["payments"]["authorizations"][0]
+        return auth, (order.get("payer") or {}).get("email_address") or ""
 
     def capture_authorization(self, auth_id: str, *, amount: Decimal, invoice_id: str, request_id: str) -> dict:
         return self._call("POST", f"/v2/payments/authorizations/{auth_id}/capture", request_id=request_id,
@@ -97,6 +102,9 @@ class PayPal:
             "amount": _amount(self.settings.currency, amount),
             "invoice_id": invoice_id,
             "final_capture": True,
+            # On the card statement. Guests have no PayPal account to look in,
+            # so this is where the real amount has to be recognisable.
+            **({"soft_descriptor": self.settings.statement_name} if self.settings.statement_name else {}),
         })
 
     def void_authorization(self, auth_id: str, *, request_id: str) -> None:

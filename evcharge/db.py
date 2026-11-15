@@ -98,7 +98,9 @@ class DB:
         self._conn.executescript(SCHEMA)
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(sessions)")}
         added = {"tariff": "TEXT", "breakdown": "TEXT", "id_tag": "TEXT",   # added after the first deploy
-                 "payment_method": "TEXT", "limit_wh": "INTEGER", "note": "TEXT", "paypal_fee": "TEXT"}
+                 "payment_method": "TEXT", "limit_wh": "INTEGER", "note": "TEXT", "paypal_fee": "TEXT",
+                 # Only until the charge settles and the receipt is sent, then cleared.
+                 "payer_email": "TEXT"}
         for col, kind in added.items():
             if col not in cols:
                 self._conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {kind}")

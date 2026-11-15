@@ -28,6 +28,7 @@ class FakePayPal:
         self.capture_status = "COMPLETED"
         self.verify = "SUCCESS"
         self.tokens = 0
+        self.payer_email = "driver@example.org"   # PayPal returns this on the order
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
         path = req.url.path
@@ -58,9 +59,12 @@ class FakePayPal:
             aid = f"AUTH{len(self.auths) + 1:08d}"
             amount = self.orders[oid]["purchase_units"][0]["amount"]
             self.auths[aid] = {"status": self.auth_status, "amount": amount, "captured": None}
-            return httpx.Response(201, json={"id": oid, "status": "COMPLETED", "purchase_units": [{"payments": {
-                "authorizations": [{"id": aid, "status": self.auth_status, "amount": amount,
-                                    "expiration_time": "2026-11-27T00:00:00Z"}]}}]})
+            return httpx.Response(201, json={
+                "id": oid, "status": "COMPLETED",
+                **({"payer": {"email_address": self.payer_email}} if self.payer_email else {}),
+                "purchase_units": [{"payments": {
+                    "authorizations": [{"id": aid, "status": self.auth_status, "amount": amount,
+                                        "expiration_time": "2026-11-27T00:00:00Z"}]}}]})
         if path.endswith("/capture"):
             aid = path.split("/")[4]
             a = self.auths[aid]
@@ -634,11 +638,17 @@ def test_session_link_in_paypal_description(tmp_path, fake):
     pay = Payments(s, DB(s.db_path), PayPal(s, transport=httpx.MockTransport(fake)))
     sid, oid = pay.create_order("CP1")
     d = fake.orders[oid]["purchase_units"][0]["description"]
-    assert d == f"EV charging, socket CP1. Progress: https://ev.example.org/pay/session/{sid}" and len(d) <= 127
+    hold = f"\u00a3{s.hold_default or s.hold_options[0]:.2f}"
+    assert d == f"Held up to {hold}, you pay for energy used. Socket CP1. https://ev.example.org/pay/session/{sid}"
+    assert len(d) <= 127
+    # PayPal truncates to about 20 characters in the driver's authorisation email,
+    # and the only figure there is the hold, three times. So the opening words have
+    # to say it is a hold - that is all most drivers will ever read.
+    assert d[:19] == f"Held up to {hold}, "[:19]
     long = Settings(db_path=str(tmp_path / "pl2.db"), **{**SETTINGS, "public_url": "https://" + "x" * 120 + ".org"})
     pay2 = Payments(long, DB(long.db_path), PayPal(long, transport=httpx.MockTransport(fake)))
     _, oid2 = pay2.create_order("CP1")
-    assert fake.orders[oid2]["purchase_units"][0]["description"] == "EV charging, socket CP1"
+    assert fake.orders[oid2]["purchase_units"][0]["description"] == f"Held up to {hold}, you pay for energy used. Socket CP1"
     with pytest.raises(ValueError):
         from_env({"PUBLIC_URL": "http://ev.example.org"})
 
@@ -729,3 +739,94 @@ def test_order_creation_does_not_need_the_full_representation():
     pp = PayPal(Settings(**SETTINGS), transport=httpx.MockTransport(handler))
     pp.create_order(amount=Decimal("20.00"), reference="s1", description="d", request_id="r1")
     assert "prefer" not in seen["/v2/checkout/orders"]
+
+
+# --- receipts ------------------------------------------------------------
+#
+# A guest has no PayPal account to look in, and PayPal only emails again if the
+# final amount is higher than the hold - which it never is here. So without a
+# receipt the driver's only figure is the hold.
+
+MAIL = dict(smtp_user="u", smtp_password="p", mail_from="ev@example.org")
+
+
+@pytest.fixture
+def posted(monkeypatch):
+    """Capture receipts instead of sending them."""
+    from evcharge import mail
+    sent = []
+    monkeypatch.setattr(mail, "send_in_background",
+                        lambda settings, to, subject, body: sent.append((to, subject, body)))
+    return sent
+
+
+def _pay_with_mail(tmp_path, fake, **over):
+    s = Settings(db_path=str(tmp_path / "r.db"), **{**SETTINGS, **MAIL, **over})
+    return Payments(s, DB(s.db_path), PayPal(s, transport=httpx.MockTransport(fake)))
+
+
+def test_no_address_is_kept_when_receipts_are_off(pay):
+    """The default build never reads or stores the driver's address."""
+    sid, _ = authorised(pay)
+    assert pay.db.session(sid)["payer_email"] is None
+    pay.settle(sid, 1000)
+    assert pay.db.session(sid)["payer_email"] is None
+
+
+def test_receipt_carries_the_final_amount_then_the_address_is_forgotten(tmp_path, fake, posted):
+    pay = _pay_with_mail(tmp_path, fake)
+    sid, _ = authorised(pay)
+    assert pay.db.session(sid)["payer_email"] == "driver@example.org"   # held, for now
+
+    s = pay.settle(sid, 1000)
+    assert s["status"] == "CAPTURED"
+    to, subject, body = posted[0]
+    assert to == "driver@example.org"
+    assert s["amount_charged"] in subject and s["amount_charged"] in body
+    assert "1.00 kWh" in body
+    assert "the rest has been released" in body
+    # kept for one purpose, and that purpose is done
+    assert pay.db.session(sid)["payer_email"] is None
+
+
+def test_a_voided_session_says_you_were_not_charged(tmp_path, fake, posted):
+    pay = _pay_with_mail(tmp_path, fake)
+    sid, _ = authorised(pay)
+    s = pay.settle(sid, 0)                      # plugged in, took nothing
+    assert s["status"] == "VOIDED"
+    to, subject, body = posted[0]
+    assert to == "driver@example.org"
+    assert "not been charged" in body and "released" in body
+    assert pay.db.session(sid)["payer_email"] is None
+
+
+def test_a_failing_mail_server_does_not_fail_the_charge(tmp_path, fake, monkeypatch):
+    """The money is taken and recorded; an undelivered receipt is a nuisance."""
+    from evcharge import mail
+    monkeypatch.setattr(mail.smtplib, "SMTP", lambda *a, **k: (_ for _ in ()).throw(OSError("no route")))
+    pay = _pay_with_mail(tmp_path, fake)
+    sid, _ = authorised(pay)
+    s = pay.settle(sid, 1000)
+    assert s["status"] == "CAPTURED" and s["amount_charged"] != "0.00"
+    assert pay.db.session(sid)["payer_email"] is None       # forgotten regardless
+    assert mail.send(pay.settings, "driver@example.org", "s", "b") is False
+
+
+def test_receipt_bodies_read_properly():
+    from evcharge import mail
+    s = Settings(**{**SETTINGS, **MAIL, "brand_name": "Example Community Hall"})
+    session = {"connector": "CP1", "amount_charged": "0.46", "energy_wh": 590, "hold_amount": "20.00"}
+    subject, body = mail.charged_body(s, session, ["0.59 kWh off-peak at 0.27/kWh"])
+    assert subject == "Your charge at Example Community Hall: £0.46"
+    assert "0.59 kWh" in body and "£0.46" in body and "£20.00" in body
+    assert "final amount" in body
+    subject, body = mail.voided_body(s, session, "no energy delivered")
+    assert "No charge taken" in subject and "not been charged" in body
+
+
+def test_partial_mail_settings_are_rejected():
+    with pytest.raises(ValueError, match="SMTP_USER"):
+        from_env({"SMTP_USER": "u", "MAIL_FROM": "ev@example.org"})      # no password
+    assert from_env({}).receipts_enabled is False
+    assert from_env({"SMTP_USER": "u", "SMTP_PASSWORD": "p",
+                     "MAIL_FROM": "ev@example.org"}).receipts_enabled is True

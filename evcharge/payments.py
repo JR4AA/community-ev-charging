@@ -20,6 +20,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 
+from . import mail
 from .config import Settings
 from .db import DB, now
 from .paypal import PayPal, PayPalError
@@ -97,7 +98,7 @@ class Payments:
                 order = self.paypal.create_order(
                     amount=hold,
                     reference=sid,
-                    description=self._description(connector, sid),
+                    description=self._description(connector, sid, hold),
                     request_id=f"order-{sid}",
                 )
             except PayPalError as e:
@@ -121,7 +122,7 @@ class Payments:
                 self.db.log(s["id"], "abandoned", "socket busy at authorise")
                 raise PaymentError(409, "Someone else has just started on this socket. You have not been charged.")
             try:
-                auth = self.paypal.authorize_order(order_id, request_id=f"authorize-{order_id}")
+                auth, payer_email = self.paypal.authorize_order(order_id, request_id=f"authorize-{order_id}")
             except PayPalError as e:
                 name = e.body.get("details", [{}])[0].get("issue") if isinstance(e.body, dict) else None
                 if name == "INSTRUMENT_DECLINED":
@@ -144,6 +145,9 @@ class Payments:
                 paypal_authorization_id=auth["id"],
                 authorization_expires=auth.get("expiration_time"),
                 authorized_at=now(),
+                # Held only until the charge settles, and only when there is
+                # somewhere to send a receipt from. Cleared in _receipt().
+                payer_email=payer_email if self.settings.receipts_enabled else None,
             )
             self.db.log(s["id"], "authorised", auth["id"])
             return self.db.session(s["id"])
@@ -238,6 +242,8 @@ class Payments:
                 error=None if status != "FAILED" else f"capture status {cap.get('status')}",
             )
             self.db.log(sid, "captured", f"{cost:.2f} {cap.get('id')} {cap.get('status')}")
+            if status == "CAPTURED":
+                self._receipt(sid, "charged")
             return self.db.session(sid)
 
     def cancel(self, sid: str, reason: str) -> dict:
@@ -310,12 +316,20 @@ class Payments:
 
     # -- helpers -----------------------------------------------------------
 
-    def _description(self, connector: str, sid: str) -> str:
-        """Shown by PayPal on the payment. With PUBLIC_URL, it carries the driver's
-        link back to their session, so nothing about them needs storing here."""
-        text = f"EV charging, socket {connector}"
+    def _description(self, connector: str, sid: str, hold: Decimal) -> str:
+        """Shown by PayPal on the payment, and on the driver's authorisation email.
+
+        PayPal truncates it to about 20 characters in that email, so the opening
+        words are all most drivers ever read - and the only other figure there is
+        the hold, repeated three times. Lead with "Held up to" so the first thing
+        they see says this is not the amount they pay. The full text, with the
+        link, still shows on PayPal's payment details page.
+        """
+        amount = f"\u00a3{hold:.2f}" if self.settings.currency == "GBP" else f"{hold:.2f} {self.settings.currency}"
+        head = f"Held up to {amount}, you pay for energy used"
+        text = f"{head}. Socket {connector}"
         if self.settings.public_url:
-            linked = f"{text}. Progress: {self.settings.public_url}/pay/session/{sid}"
+            linked = f"{text}. {self.settings.public_url}/pay/session/{sid}"
             if len(linked) <= 127:      # PayPal's limit for purchase_units[].description
                 return linked
         return text
@@ -335,6 +349,34 @@ class Payments:
         auth_id = ((res.get("supplementary_data") or {}).get("related_ids") or {}).get("authorization_id")
         return self.db.session_by_authorization(auth_id) if auth_id else None
 
+    def _receipt(self, sid: str, kind: str, reason: str = "") -> None:
+        """Send the driver their final figure, then forget their address.
+
+        The address is cleared whether or not the send worked: it was kept for
+        this one purpose and the session is over. Sending happens on its own
+        thread, so a slow mail server cannot hold up settlement.
+        """
+        s = self.db.session(sid)
+        if not s:
+            return
+        to = s["payer_email"] if "payer_email" in s.keys() else None
+        if to:
+            self.db.update_session(sid, payer_email=None)
+        if not to or not self.settings.receipts_enabled:
+            return
+        parts = []
+        if s["breakdown"]:
+            try:
+                for name, part in json.loads(s["breakdown"]).items():
+                    parts.append(f"{part['wh'] / 1000:.2f} kWh {name} at {part['price']}/kWh")
+            except Exception:      # a receipt is never worth failing over
+                parts = []
+        if kind == "charged":
+            subject, body = mail.charged_body(self.settings, dict(s), parts)
+        else:
+            subject, body = mail.voided_body(self.settings, dict(s), reason)
+        mail.send_in_background(self.settings, to, subject, body)
+
     def _void(self, s: dict, reason: str) -> dict:
         try:
             self.paypal.void_authorization(s["paypal_authorization_id"], request_id=f"void-{s['id']}")
@@ -343,6 +385,9 @@ class Payments:
             raise PaymentError(502, "PayPal void failed") from e
         self.db.update_session(s["id"], status="VOIDED", amount_charged="0.00", error=reason)
         self.db.log(s["id"], "voided", reason)
+        # A driver who paid, plugged in and took nothing has seen a hold and
+        # otherwise hears nothing at all. That is the most alarming case.
+        self._receipt(s["id"], "voided", reason)
         return self.db.session(s["id"])
 
     def _fail_or_retry(self, sid: str, e: PayPalError, step: str) -> None:

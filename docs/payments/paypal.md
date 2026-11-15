@@ -58,3 +58,60 @@ penny, keeps every charge above cost.
 4. To go live, create a **Live** app with its own credentials and webhook, set
    `PAYPAL_ENV=live`, and restart. Card-only checkout needs "PayPal account
    optional" turned on in the business account's website payment settings.
+
+
+## The receipt email
+
+PayPal emails the driver once, when the hold is authorised, and says it will
+only write again *if the final amount is greater* - which, with authorise-then-
+partial-capture, it never is. So a driver who holds £20 and pays £0.46 is told
+about the £20 and nothing else.
+
+That matters more than it sounds, because card-only guest checkout means most
+drivers have no PayPal account to look in. Their only record of what they
+actually paid is a card statement, days later. We checked a real authorisation
+email: PayPal truncates the order description to about 20 characters, so a
+session link put there never reaches them, and the invoice id is not in the
+email at all.
+
+So the server can send one receipt itself. Set:
+
+```
+SMTP_USER=you@example.org          # the account that authenticates
+SMTP_PASSWORD=...                  # an app password, not the login password
+MAIL_FROM=ev@example.org           # an alias of that account, or the account
+MAIL_REPLY_TO=ev@example.org       # optional; defaults to MAIL_FROM
+SMTP_HOST=smtp.gmail.com           # optional, this is the default
+SMTP_PORT=587                      # optional
+```
+
+All three of `SMTP_USER`, `SMTP_PASSWORD` and `MAIL_FROM` are needed together;
+set none and the feature is off, and **no address is ever read or stored**.
+
+**Where the address comes from, and how long it is kept.** PayPal returns the
+payer's email on the order when the hold is authorised. It is written to the
+session row only if receipts are configured, used once when the charge settles,
+and cleared in the same breath - whether or not the send succeeded. It is never
+written to a log. Nothing else reads it.
+
+A receipt goes out in both final cases:
+
+- **charged** - socket, energy, the amount taken, the per-rate breakdown, and a
+  note that the rest of the hold is released;
+- **nothing taken** - the driver plugged in, paid, and drew no energy. They have
+  seen a hold and would otherwise hear nothing, which is the most alarming case
+  of the two.
+
+Sending is on a background thread and failures are swallowed: the money is
+already captured and recorded, and an undelivered receipt is a nuisance, not a
+reason to fail a charge or leave a session unsettled.
+
+**Tell the driver.** With receipts on, the payment page says so - that they will
+get one receipt to the address they give PayPal, that it is deleted once the
+charge is paid for, and that it is used for nothing else. Say it before they
+pay rather than letting them find out from an unexpected email.
+
+**Deliverability.** Send from a domain whose SPF and DKIM already cover the
+route - a Google Workspace account sending through Google is the easy case. A
+receipt in a spam folder is worse than none, because the driver has been told to
+expect it.

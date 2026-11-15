@@ -172,8 +172,11 @@ class ChargePoint(OcppChargePoint):
     def on_heartbeat(self):
         # The natural moment to refresh the radio strength: it is already the
         # charger saying "still here", and the read is rate limited, so a short
-        # heartbeat interval costs nothing extra.
-        asyncio.create_task(self.csms.refresh_signal(self.id))
+        # heartbeat interval costs nothing extra. No key configured, no task:
+        # spawning one per heartbeat only to return immediately is waste, and
+        # leaves orphan tasks behind when a loop is torn down.
+        if self.csms.settings.signal_key:
+            asyncio.create_task(self.csms.refresh_signal(self.id))
         return call_result.Heartbeat(current_time=datetime.now(timezone.utc).isoformat())
 
     @on(Action.status_notification)

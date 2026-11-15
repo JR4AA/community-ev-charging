@@ -147,6 +147,11 @@ def test_no_price_messages_unless_supported_and_wanted(tmp_path, fake, screen, s
 
 def test_admin_charger_page(tmp_path, fake):
     app, c, sim = start(tmp_path, fake)
+    # configure() runs on its own task: settings are read and the price display
+    # set up after the charger connects. Without waiting, this races it - the
+    # 2.0.1 version of this test has always waited, this one only got away with
+    # it while the suite was quick enough.
+    wait_for(lambda: app.state.csms.display.get("CP1"))
     page = c.get("/admin/chargers/CP1", headers=AUTH).text
     assert "Simulator" in page and "online" in page and "NetworkType" in page and "WifiSignalStrength" in page
     assert "Read settings from the charger" in page and "Prices on its screen</th><td>yes" in page

@@ -54,6 +54,20 @@ class Settings:
     # A charger that reports radio signal strength in a (vendor-specific)
     # configuration key, e.g. OEM_RSSI = "Modem: -71. WiFi: -88 dBm." on the
     # Sync Energy EVPCXS222. Unset, nothing is read and nothing is reported.
+    # What the driver sees on their card statement (PayPal soft_descriptor,
+    # about 22 characters). Most of them are guests with no PayPal account, so
+    # the statement is the one place the real amount reliably reaches them.
+    # Emailing the driver a receipt with the final amount. Optional: leave the
+    # SMTP settings unset and no address is ever read or stored. See mail.py for
+    # why it matters - a guest has no PayPal account to look in, and PayPal only
+    # emails again if the final amount is higher, which it never is.
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    mail_from: str = ""
+    mail_reply_to: str = ""
+    statement_name: str = ""
     signal_key: str = ""
     signal_interval: int = 300          # seconds; it is re-read no more often than this
     tls_check_name: str = ""
@@ -111,6 +125,11 @@ class Settings:
     @property
     def paypal_api(self) -> str:
         return PAYPAL_API[self.paypal_env]
+
+    @property
+    def receipts_enabled(self) -> bool:
+        """Email a receipt only when there is somewhere to send it from."""
+        return bool(self.smtp_user and self.smtp_password and self.mail_from)
 
     @property
     def paypal_configured(self) -> bool:
@@ -200,6 +219,13 @@ def from_env(env: dict[str, str] | None = None) -> Settings:
         stop_margin_wh=int(env.get("STOP_MARGIN_WH", d.stop_margin_wh)),
         admin_password=env.get("ADMIN_PASSWORD", ""),
         api_token=env.get("API_TOKEN", ""),
+        smtp_host=env.get("SMTP_HOST", d.smtp_host).strip(),
+        smtp_port=int(env.get("SMTP_PORT", d.smtp_port)),
+        smtp_user=env.get("SMTP_USER", "").strip(),
+        smtp_password=env.get("SMTP_PASSWORD", ""),
+        mail_from=env.get("MAIL_FROM", "").strip(),
+        mail_reply_to=env.get("MAIL_REPLY_TO", "").strip(),
+        statement_name=env.get("STATEMENT_NAME", "").strip()[:22],
         signal_key=env.get("SIGNAL_KEY", "").strip(),
         signal_interval=int(env.get("SIGNAL_INTERVAL", d.signal_interval)),
         tls_check_name=env.get("TLS_CHECK", "").strip(),
@@ -221,6 +247,8 @@ def from_env(env: dict[str, str] | None = None) -> Settings:
         raise ValueError("PUBLIC_URL must start with https://")
     if s.tls_check_name and ("/" in s.tls_check_name or ":" in s.tls_check_name):
         raise ValueError("TLS_CHECK is a hostname only; use TLS_CHECK_PORT for the port")
+    if (s.smtp_user or s.smtp_password or s.mail_from) and not s.receipts_enabled:
+        raise ValueError("receipts need SMTP_USER, SMTP_PASSWORD and MAIL_FROM together")
     if s.display_prices not in ("auto", "off"):
         raise ValueError("DISPLAY_PRICES must be auto or off")
     if s.payment_methods not in ("card", "all"):

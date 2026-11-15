@@ -22,9 +22,13 @@ energy they used and releases the rest.
 - **Time-of-use pricing**: peak and off-peak bands in local time, each kWh priced
   by when it was delivered, plus an optional per-charge fee and an optional
   solar-surplus rate.
-- **No personal data stored**: no names, emails or card details; PayPal handles
-  all of that.
+- **Almost no personal data**: no names and no card details - PayPal handles all
+  of that. Turn receipts on and the payer's email is held from payment until the
+  charge settles, used for that one message, then cleared; leave them off and no
+  address is ever read.
 - **Configurable branding**: name, logo, colour, footer.
+- **A receipt the driver actually gets** (optional): PayPal tells them about the
+  hold and never about the final amount, and a guest has no account to look in.
 - **Admin page on your own network**: live sessions, stop a charge, authorise a
   free charge by kWh or £; every charge with monthly totals and a CSV.
 - **Home Assistant integration** (installable with HACS): a device per socket with

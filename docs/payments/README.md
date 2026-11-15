@@ -27,6 +27,14 @@ So a provider needs: a hosted card page the driver can use without an account,
 an authorise-and-later-capture flow with partial capture, a way to void an
 authorisation if no energy is taken, and webhooks to confirm what happened.
 
+## Telling the driver what they paid
+
+A provider that holds an amount and captures less will usually tell the payer
+about the *hold* and not the final figure. If most of your drivers pay as guests,
+they have no account to look in either. Whatever the provider, check what the
+payer is actually told before assuming they know what they paid - and see
+[paypal.md](paypal.md) for how this project fills that gap with one receipt.
+
 ## Fees
 
 Whatever the provider, the per-charge fixed fee is the thing to design around:
