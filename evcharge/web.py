@@ -59,6 +59,25 @@ POWERED_BY = (f'<p class="small powered">Powered by <a href="{PROJECT_URL}" rel=
               'community-ev-charging</a>, open source.</p>')
 READY = "Preparing"   # cable connected, no transaction yet
 IN_USE = ("Charging", "SuspendedEV", "SuspendedEVSE", "Finishing", "Reserved")
+
+
+def socket_label(state: str, busy: bool) -> str:
+    """What a driver standing at the charger is told about a socket.
+
+    Deliberately not OCPP's own words: "Preparing" and "SuspendedEVSE" mean
+    nothing to a driver. And deliberately not "free" for an idle socket - on a
+    charger that takes payment that reads as "no charge" rather than "nobody is
+    using it".
+    """
+    if busy or state in IN_USE:
+        return "in use"
+    if state == OFFLINE:
+        return "offline"
+    if state in ("Faulted", "Unavailable"):
+        return "out of service"
+    if state == READY:
+        return "car plugged in"
+    return "available"
 ORDER_ID = re.compile(r"^[A-Z0-9]{10,40}$")
 SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{16,40}$")
 
@@ -168,16 +187,7 @@ def create_app(settings: config.Settings | None = None, paypal: PayPal | None = 
         rows = []
         for c in settings.connectors:
             state = csms.socket_state(c)
-            if payments.connector_busy(c) or state in IN_USE:
-                what = "in use"
-            elif state == OFFLINE:
-                what = "offline"
-            elif state in ("Faulted", "Unavailable"):
-                what = "out of service"
-            elif state == READY:
-                what = "car plugged in"
-            else:
-                what = "free"
+            what = socket_label(state, payments.connector_busy(c))
             power = settings.power_label(c)
             rows.append(f'<tr><td><a href="/pay/{html.escape(c)}">Socket {html.escape(c)}</a></td>'
                         f'<td class=small>{html.escape(power)}</td><td>{what}</td></tr>')

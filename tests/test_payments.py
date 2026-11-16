@@ -653,6 +653,26 @@ def test_session_link_in_paypal_description(tmp_path, fake):
         from_env({"PUBLIC_URL": "http://ev.example.org"})
 
 
+def test_socket_labels_are_what_a_driver_would_say():
+    """OCPP's own words mean nothing to a driver standing at the charger."""
+    from evcharge.web import socket_label
+
+    # An idle socket is "available", never "free": on a charger that takes
+    # payment, "free" reads as "no charge".
+    assert socket_label("Available", False) == "available"
+    assert socket_label("Available", True) == "in use"       # paid for, not yet plugged in
+    assert socket_label("Preparing", False) == "car plugged in"
+    assert socket_label("Charging", False) == "in use"
+    assert socket_label("Finishing", False) == "in use"
+    assert socket_label("SuspendedEVSE", False) == "in use"
+    assert socket_label("Offline", False) == "offline"
+    assert socket_label("Faulted", False) == "out of service"
+    assert socket_label("Unavailable", False) == "out of service"
+    assert "free" not in {socket_label(s, b)
+                          for s in ("Available", "Preparing", "Charging", "Offline", "Faulted")
+                          for b in (True, False)}
+
+
 def test_session_remembered_on_the_phone(client):
     oid = client.post("/pay/api/orders", json={"connector": "CP1"}).json()["orderID"]
     sid = client.post(f"/pay/api/orders/{oid}/authorize").json()["session"]
